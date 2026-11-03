@@ -1,0 +1,9 @@
+[package]
+name = "walkmap"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+glam.workspace = true
+plateau-gml.workspace = true

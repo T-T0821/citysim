@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/plateau-gml", "crates/walkmap", "crates/crowd", "crates/cli"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+quick-xml = "0.36"
+glam = "0.29"
+anyhow = "1"
+plateau-gml = { path = "crates/plateau-gml" }
+walkmap = { path = "crates/walkmap" }
+crowd = { path = "crates/crowd" }
+
+[profile.release]
+debug = false
