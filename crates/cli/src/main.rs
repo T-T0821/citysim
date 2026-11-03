@@ -7,12 +7,11 @@
 mod png;
 
 use anyhow::{bail, Context, Result};
-use crowd::{Agent, Params, Rng, Simulation};
-use glam::Vec2;
+use crowd::Simulation;
 use plateau_gml::CityModel;
 use std::io::Write;
 use std::path::PathBuf;
-use walkmap::{FlowField, WalkGrid};
+use walkmap::WalkGrid;
 
 struct Args {
     gml: Vec<PathBuf>,
@@ -105,58 +104,9 @@ fn main() -> Result<()> {
         100.0 * n_walk as f32 / (grid.w * grid.h) as f32
     );
 
-    // 目的地: 対象範囲の東西南北の縁にある歩行可能セル（通過交通を想定）
-    let (w, h) = (grid.w, grid.h);
-    let edges: [(&str, Box<dyn Fn(usize, usize) -> bool>); 4] = [
-        ("西", Box::new(|x, _| x < 2)),
-        ("東", Box::new(move |x, _| x + 3 > w)),
-        ("南", Box::new(|_, y| y < 2)),
-        ("北", Box::new(move |_, y| y + 3 > h)),
-    ];
-    let mut flows = vec![];
-    for (name, pred) in edges.iter() {
-        let cells: Vec<_> = grid.walkable_cells().filter(|&(x, y)| pred(x, y)).collect();
-        if cells.is_empty() {
-            continue;
-        }
-        eprintln!("目的地 {name}: {} セル", cells.len());
-        flows.push(FlowField::compute(&grid, &cells));
-    }
-    if flows.is_empty() {
-        bail!("範囲の縁に歩行可能領域がありません");
-    }
-
-    let mut sim = Simulation::new(grid, flows, Params::default());
-    let mut rng = Rng::new(args.seed);
-    let cells: Vec<_> = sim.grid.walkable_cells().collect();
-    let mut tries = 0;
-    while sim.agents.len() < args.agents && tries < args.agents * 100 {
-        tries += 1;
-        let (cx, cy) = cells[(rng.next_u64() % cells.len() as u64) as usize];
-        let pos = sim.grid.center(cx, cy)
-            + Vec2::new(rng.range(-0.2, 0.2), rng.range(-0.2, 0.2)) * sim.grid.cell;
-        let goal = (rng.next_u64() % sim.goals.len() as u64) as usize;
-        if sim.grid.obstacle_sample(pos).0 < 0.35
-            || !sim.goals[goal].distance(&sim.grid, pos).is_finite()
-        {
-            continue;
-        }
-        if sim
-            .agents
-            .iter()
-            .any(|a| a.pos.distance_squared(pos) < 0.36)
-        {
-            continue;
-        }
-        sim.agents.push(Agent {
-            pos,
-            vel: Vec2::ZERO,
-            radius: rng.range(0.22, 0.28),
-            desired_speed: rng.normal(1.34, 0.26).clamp(0.6, 2.0),
-            goal,
-            arrived: false,
-        });
-    }
+    let (mut sim, goal_names) = crowd::scenario::through_traffic(grid, args.agents, args.seed)
+        .context("範囲の縁に歩行可能領域がありません")?;
+    eprintln!("目的地: {}", goal_names.join(", "));
     eprintln!("エージェント: {} 人", sim.agents.len());
 
     let mut csv = match &args.csv {

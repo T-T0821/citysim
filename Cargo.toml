@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/plateau-gml", "crates/walkmap", "crates/crowd", "crates/cli"]
+members = ["crates/plateau-gml", "crates/walkmap", "crates/crowd", "crates/cli", "crates/viewer"]
 
 [workspace.package]
 edition = "2021"
@@ -17,3 +17,7 @@ crowd = { path = "crates/crowd" }
 
 [profile.release]
 debug = false
+
+# bevy は debug ビルドだと極端に遅いので依存クレートだけ最適化する
+[profile.dev.package."*"]
+opt-level = 2

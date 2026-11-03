@@ -10,6 +10,7 @@ crates/
   walkmap/      緯度経度→局所平面、歩行可能グリッド、フローフィールド、障害物距離場
   crowd/        Social Force Model によるエージェント計算
   cli/          ヘッドレス実行。軌跡 CSV と通行量ヒートマップ PNG を出力
+  viewer/       bevy 0.16 による 3D ビューア（建物の押し出し表示 + 歩行者 + ヒートマップ）
 testdata/       合成テストデータ（東京駅付近 120m 四方の十字路と 5 棟）
 ```
 
@@ -32,12 +33,33 @@ cargo run --release -- --gml udx/bldg/53394611_bldg_6697_op.gml \
     --gml udx/tran/53394611_tran_6697_op.gml --agents 2000
 ```
 
+## 3D ビューア
+
+```sh
+cargo run --release -p plateau-crowd-viewer -- --gml testdata/sample.gml --agents 600
+```
+
+| 操作 | 内容 |
+|---|---|
+| 左ドラッグ / 右ドラッグ / ホイール | 回転 / 平行移動 / ズーム |
+| Space | 一時停止 |
+| ↑ / ↓ | 再生速度 ×2 / ×½ |
+| H | 通行量ヒートマップの表示切替 |
+
+歩行者は目的地（東西南北の縁）ごとに色分けされ、到着すると別の縁から再投入されます（`--no-respawn` で無効）。
+`--screenshot out.png 60` でシミュレーション 60 秒時点の画面を保存して終了します（`PLATEAU_SHOW_HEAT=1` でヒートマップ付き）。
+
+Linux では `libxkbcommon-x11-0` と Vulkan ドライバ（GPU のもの、または `mesa-vulkan-drivers`）が必要です。
+
+![viewer](docs/viewer.png)
+
 ## ロードマップ
 
 - [x] MVP: CityGML 読込 → グリッド → フローフィールド → Social Force → CSV/PNG
 - [ ] 実データ検証（PLATEAU の bldg + tran を 1 メッシュ分）、大きなファイルの高速化
 - [ ] シナリオ定義（TOML）: 出発地・目的地（駅出口など）・発生レート・時間帯
-- [ ] 可視化: bevy で 3D 建物 + エージェントのリアルタイム表示（または wasm + WebGPU）
+- [x] 可視化: bevy で 3D 建物 + エージェントのリアルタイム表示
+- [ ] 可視化の拡張: LOD2 の屋根形状・テクスチャ、地形 (dem)、wasm + WebGPU でブラウザ表示
 - [ ] 速度向上: rayon による並列化、密度に応じた計算（数万人規模）
 - [ ] 評価指標: 密度（人/m²）、流量、サービス水準 (LOS)、避難完了時間
 - [ ] 歩道 (`tran:TrafficArea` の function)、横断歩道、階段・建物入口の扱い
