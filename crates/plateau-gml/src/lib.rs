@@ -5,6 +5,7 @@
 //! ここでは人流シミュレーションに必要な 2.5D 情報だけを取り出す:
 //! - 建物 (`bldg:Building`) のフットプリント（LOD0 または LOD1 の底面）
 //! - 道路 (`tran:Road`) の LOD1 面（歩行可能領域の候補）
+//! - 道路の LOD2/LOD3 `tran:TrafficArea`（車道部・歩道部・島などの区分面）
 
 pub mod obj;
 
@@ -31,10 +32,33 @@ pub enum FeatureKind {
     Road,
 }
 
+/// 道路の区分面 (`tran:TrafficArea` / `tran:AuxiliaryTrafficArea`)。LOD2 以上の道路にだけ入る。
+#[derive(Debug, Clone)]
+pub struct TrafficArea {
+    /// PLATEAU の TrafficArea_function コード
+    /// （1000 車道部, 1010 車道交差部, 1020 島, 2000 歩道部, 3000 自転車道 など）。
+    pub function: u32,
+    /// `tran:AuxiliaryTrafficArea`（植栽・分離帯など、通行しない部分）か
+    pub auxiliary: bool,
+    /// 面のポリゴン群（LOD3 があれば LOD3、無ければ LOD2）
+    pub rings: Vec<Ring>,
+}
+
+impl TrafficArea {
+    /// 車が走る部分（車道部・車道交差部・島）。島は車道に挟まれた安全地帯で、道路網の抽出では車道側に含める。
+    pub fn is_carriageway(&self) -> bool {
+        !self.auxiliary && matches!(self.function, 1000 | 1010 | 1020)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Feature {
     pub kind: FeatureKind,
     pub gml_id: Option<String>,
+    /// `gml:name`（道路なら路線名。首都高速などの立体交差の除外に使う）
+    pub name: Option<String>,
+    /// 道路の区分面。LOD1 だけの道路や建物では空。
+    pub areas: Vec<TrafficArea>,
     /// 建物: フットプリント 1 つ（底面）。道路: 路面ポリゴン群。
     pub rings: Vec<Ring>,
     /// 建物の計測高さ (`bldg:measuredHeight`)。
@@ -57,6 +81,12 @@ impl CityModel {
     }
     pub fn roads(&self) -> impl Iterator<Item = &Feature> {
         self.features.iter().filter(|f| f.kind == FeatureKind::Road)
+    }
+    /// 歩行者・車の 2D シミュレーションに使う地上の道路。
+    /// 高速道路（名前に「高速」を含む路線）は高架・掘割で地上と交わらないので除く。
+    pub fn ground_roads(&self) -> impl Iterator<Item = &Feature> {
+        self.roads()
+            .filter(|f| !f.name.as_deref().is_some_and(|n| n.contains("高速")))
     }
     pub fn merge(&mut self, other: CityModel) {
         self.features.extend(other.features);
@@ -100,9 +130,13 @@ pub fn parse_str(s: &str) -> Result<CityModel> {
 struct Pending {
     kind: FeatureKind,
     gml_id: Option<String>,
+    name: Option<String>,
     lod0: Vec<Ring>,
     lod1: Vec<Ring>,
     height: Option<f64>,
+    areas: Vec<TrafficArea>,
+    /// 走査中の TrafficArea（auxiliary, function, lod2 面, lod3 面）
+    area: Option<(bool, u32, Vec<Ring>, Vec<Ring>)>,
 }
 
 pub fn parse_reader<R: BufRead>(src: R) -> Result<CityModel> {
@@ -137,11 +171,20 @@ pub fn parse_reader<R: BufRead>(src: R) -> Result<CityModel> {
                         cur = Some(Pending {
                             kind,
                             gml_id,
+                            name: None,
                             lod0: vec![],
                             lod1: vec![],
                             height: None,
+                            areas: vec![],
+                            area: None,
                         });
                         cur_depth = stack.len();
+                    }
+                } else if let Some(p) = cur.as_mut() {
+                    match qname.as_str() {
+                        "tran:TrafficArea" => p.area = Some((false, 0, vec![], vec![])),
+                        "tran:AuxiliaryTrafficArea" => p.area = Some((true, 0, vec![], vec![])),
+                        _ => {}
                     }
                 }
                 stack.push(name);
@@ -157,12 +200,38 @@ pub fn parse_reader<R: BufRead>(src: R) -> Result<CityModel> {
                         "posList" => {
                             let ring = parse_pos_list(&text);
                             if ring.len() >= 3 {
-                                if stack.iter().any(|s| s.starts_with("lod0")) {
+                                if let Some(a) = p.area.as_mut() {
+                                    if stack.iter().any(|s| s.starts_with("lod3")) {
+                                        a.3.push(ring);
+                                    } else if stack.iter().any(|s| s.starts_with("lod2")) {
+                                        a.2.push(ring);
+                                    }
+                                } else if stack.iter().any(|s| s.starts_with("lod0")) {
                                     p.lod0.push(ring);
                                 } else if stack.iter().any(|s| s.starts_with("lod1")) {
                                     p.lod1.push(ring);
                                 }
                             }
+                        }
+                        "function" => {
+                            if let Some(a) = p.area.as_mut() {
+                                a.1 = text.trim().parse().unwrap_or(0);
+                            }
+                        }
+                        "TrafficArea" | "AuxiliaryTrafficArea" => {
+                            if let Some((auxiliary, function, lod2, lod3)) = p.area.take() {
+                                let rings = if lod3.is_empty() { lod2 } else { lod3 };
+                                if !rings.is_empty() {
+                                    p.areas.push(TrafficArea {
+                                        function,
+                                        auxiliary,
+                                        rings,
+                                    });
+                                }
+                            }
+                        }
+                        "name" if stack.len() == cur_depth + 1 && p.name.is_none() => {
+                            p.name = Some(text.trim().to_string());
                         }
                         "measuredHeight" => p.height = text.trim().parse().ok(),
                         _ => {}
@@ -218,6 +287,15 @@ fn finish(p: Pending) -> Option<Feature> {
             if rs.is_empty() {
                 rs = p.lod0;
             }
+            if rs.is_empty() {
+                // LOD2/LOD3 だけの道路: 区分面を合わせたものを路面とする
+                rs = p
+                    .areas
+                    .iter()
+                    .filter(|a| !a.auxiliary)
+                    .flat_map(|a| a.rings.iter().cloned())
+                    .collect();
+            }
             rs
         }
     };
@@ -227,6 +305,8 @@ fn finish(p: Pending) -> Option<Feature> {
     Some(Feature {
         kind: p.kind,
         gml_id: p.gml_id,
+        name: p.name,
+        areas: p.areas,
         rings,
         height: p.height,
         solid: vec![],
@@ -277,5 +357,79 @@ mod tests {
         assert!(b.height.is_some());
         // 底面が選ばれている
         assert!(b.rings[0].iter().all(|p| p.h < 1.0));
+    }
+}
+
+#[cfg(test)]
+mod traffic_area_tests {
+    use super::*;
+
+    const ROAD_LOD3: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<core:CityModel xmlns:core="http://www.opengis.net/citygml/2.0" xmlns:gml="http://www.opengis.net/gml" xmlns:tran="http://www.opengis.net/citygml/transportation/2.0">
+<core:cityObjectMember><tran:Road gml:id="r1">
+<gml:name>都道1号</gml:name>
+<tran:function codeSpace="x">3</tran:function>
+<tran:lod1MultiSurface><gml:MultiSurface><gml:surfaceMember><gml:Polygon><gml:exterior><gml:LinearRing>
+<gml:posList>35.0 139.0 0 35.0 139.001 0 35.0001 139.001 0 35.0001 139.0 0 35.0 139.0 0</gml:posList>
+</gml:LinearRing></gml:exterior></gml:Polygon></gml:surfaceMember></gml:MultiSurface></tran:lod1MultiSurface>
+<tran:trafficArea><tran:TrafficArea gml:id="t1">
+<tran:function codeSpace="x">1000</tran:function>
+<tran:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember><gml:Polygon><gml:exterior><gml:LinearRing>
+<gml:posList>35.0 139.0 0 35.0 139.001 0 35.00005 139.001 0 35.00005 139.0 0</gml:posList>
+</gml:LinearRing></gml:exterior></gml:Polygon></gml:surfaceMember></gml:MultiSurface></tran:lod2MultiSurface>
+<tran:lod3MultiSurface><gml:MultiSurface><gml:surfaceMember><gml:Polygon><gml:exterior><gml:LinearRing>
+<gml:posList>35.0 139.0 1 35.0 139.001 1 35.00005 139.001 1</gml:posList>
+</gml:LinearRing></gml:exterior></gml:Polygon></gml:surfaceMember>
+<gml:surfaceMember><gml:Polygon><gml:exterior><gml:LinearRing>
+<gml:posList>35.0 139.0 1 35.00005 139.001 1 35.00005 139.0 1</gml:posList>
+</gml:LinearRing></gml:exterior></gml:Polygon></gml:surfaceMember></gml:MultiSurface></tran:lod3MultiSurface>
+</tran:TrafficArea></tran:trafficArea>
+<tran:trafficArea><tran:TrafficArea gml:id="t2">
+<tran:function codeSpace="x">2000</tran:function>
+<tran:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember><gml:Polygon><gml:exterior><gml:LinearRing>
+<gml:posList>35.00005 139.0 0 35.00005 139.001 0 35.0001 139.001 0 35.0001 139.0 0</gml:posList>
+</gml:LinearRing></gml:exterior></gml:Polygon></gml:surfaceMember></gml:MultiSurface></tran:lod2MultiSurface>
+</tran:TrafficArea></tran:trafficArea>
+<tran:auxiliaryTrafficArea><tran:AuxiliaryTrafficArea gml:id="a1">
+<tran:function codeSpace="x">1000</tran:function>
+<tran:lod2MultiSurface><gml:MultiSurface><gml:surfaceMember><gml:Polygon><gml:exterior><gml:LinearRing>
+<gml:posList>35.00005 139.0 0 35.00005 139.0001 0 35.00006 139.0001 0</gml:posList>
+</gml:LinearRing></gml:exterior></gml:Polygon></gml:surfaceMember></gml:MultiSurface></tran:lod2MultiSurface>
+</tran:AuxiliaryTrafficArea></tran:auxiliaryTrafficArea>
+</tran:Road></core:cityObjectMember>
+<core:cityObjectMember><tran:Road gml:id="r2">
+<gml:name>首都高速都心環状線</gml:name>
+<tran:lod1MultiSurface><gml:MultiSurface><gml:surfaceMember><gml:Polygon><gml:exterior><gml:LinearRing>
+<gml:posList>35.0 139.0 10 35.0 139.001 10 35.0001 139.001 10</gml:posList>
+</gml:LinearRing></gml:exterior></gml:Polygon></gml:surfaceMember></gml:MultiSurface></tran:lod1MultiSurface>
+</tran:Road></core:cityObjectMember>
+</core:CityModel>"#;
+
+    #[test]
+    fn parses_traffic_areas_and_names() {
+        let m = parse_str(ROAD_LOD3).unwrap();
+        assert_eq!(m.roads().count(), 2);
+        let r = m
+            .roads()
+            .find(|r| r.gml_id.as_deref() == Some("r1"))
+            .unwrap();
+        assert_eq!(r.name.as_deref(), Some("都道1号"));
+        assert_eq!(r.rings.len(), 1, "LOD1 の路面");
+        assert_eq!(r.areas.len(), 3);
+        let car = &r.areas[0];
+        assert_eq!(car.function, 1000);
+        assert!(car.is_carriageway());
+        // LOD3 があれば LOD3（三角形 2 枚）が使われる
+        assert_eq!(car.rings.len(), 2);
+        assert_eq!(car.rings[0][0].h, 1.0);
+        let walk = &r.areas[1];
+        assert_eq!(walk.function, 2000);
+        assert!(!walk.is_carriageway());
+        assert_eq!(walk.rings.len(), 1);
+        assert!(r.areas[2].auxiliary);
+        // 首都高は地上の道路から除かれる
+        let ground: Vec<_> = m.ground_roads().collect();
+        assert_eq!(ground.len(), 1);
+        assert_eq!(ground[0].gml_id.as_deref(), Some("r1"));
     }
 }

@@ -12,13 +12,16 @@ crates/
   traffic/      車道の中心線ネットワーク抽出と車両の計算（IDM・左側通行・交差点制御）
   cli/          ヘッドレス実行。軌跡 CSV と通行量ヒートマップ PNG を出力
   viewer/       bevy 0.16 による 3D ビューア（建物の押し出し表示 + 歩行者 + ヒートマップ）
-testdata/       合成テストデータ（東京駅付近 200m 四方、幅 20m の「井」の字の道路と 15 棟）
+scripts/        公式 CityGML の取得 (fetch-ginza.sh) と範囲切り出し (extract_gml.py)
+testdata/
+  sample.gml    合成テストデータ（東京駅付近 200m 四方、幅 20m の「井」の字の道路と 15 棟）
+  ginza/        公式 PLATEAU CityGML から切り出した銀座 4 丁目交差点周辺（建物 457 棟、LOD3 道路 160 件）
 ```
 
 処理の流れ:
 
 1. **読込**: `bldg:Building` の LOD0 フットプリント（無ければ LOD1 立体の底面）と `tran:Road` の LOD1 路面を取得。座標は EPSG:6697（緯度・経度・楕円体高）。
-2. **歩行空間**: 道路面があれば「道路 ∖ 建物」、無ければ「範囲 ∖ 建物」を 0.5m グリッドに塗る。道路の端から 3m を歩道、それより内側を車道とみなす（LOD1 の道路面は歩道と車道を区別しないための近似）。
+2. **歩行空間**: 道路面があれば「道路 ∖ 建物」、無ければ「範囲 ∖ 建物」を 0.5m グリッドに塗る。LOD2/LOD3 の道路なら `tran:TrafficArea` の区分（1000 車道部・1020 島 → 車道、2000 歩道部・3000 自転車道 → 歩道、`AuxiliaryTrafficArea` の植栽・分離帯 → 通行不可）をそのまま使う。LOD1 だけの道路では道路の端から 3m を歩道、それより内側を車道とみなす近似を使う。名前に「高速」を含む路線（高架・掘割の首都高）は地上と交わらないので除く。
 3. **経路誘導**: 目的地ごとに 8 近傍 Dijkstra で距離場（フローフィールド）を作る。壁際はコスト増。
 4. **歩行者モデル**: 駆動力 + 他者反発（視野異方性つき）+ 壁反発 + 車からの反発 + 接触力。近傍探索は空間ハッシュ。車道の通行コストを 6 倍にして、歩道を歩き車道は短く横断するようにしている。
 5. **車両モデル**:
@@ -40,6 +43,31 @@ cargo run --release -- --gml udx/bldg/53394611_bldg_6697_op.gml \
 ```
 
 ## 実際の PLATEAU データで動かす
+
+### まず試す: 銀座 4 丁目交差点（同梱の公式 CityGML 抜粋）
+
+東京都 23 区（2023 年度）の CityGML から銀座 4 丁目交差点（和光・三越前）を中心とする半径 260m を切り出したものを `testdata/ginza/` に同梱しています。
+LOD3 の道路（車道部・歩道部・島）が入っているので、中央通り・晴海通りの広い歩道と車道が実際の形で区別されます。
+
+```sh
+cargo run --release -p plateau-crowd-viewer -- --gml testdata/ginza/53394601_bldg_6697_op.gml \
+    --gml testdata/ginza/53394601_tran_6697_op.gml --crop 35.67165,139.76500,220 --agents 1500 --vehicles 40
+
+# ヘッドレスで CSV / ヒートマップ / 確認用地図
+cargo run --release -- --gml testdata/ginza/53394601_bldg_6697_op.gml --gml testdata/ginza/53394601_tran_6697_op.gml \
+    --crop 35.67165,139.76500,220 --agents 1000 --vehicles 30 --duration 300 --csv ginza.csv --png ginza-heat.png --map-png ginza-map.png
+```
+
+![ginza 3d](docs/ginza-3d.png)
+
+![ginza map](docs/ginza-map.png)
+
+地図の明るい灰色が歩道部、暗い灰色が車道部（LOD3 の TrafficArea 由来）、白線が抽出した車道の中心線です。
+
+メッシュ全体（銀座・有楽町・新橋・日比谷、建物 2297 棟・道路 1007 件、約 290MB）は `scripts/fetch-ginza.sh` で取得できます。
+別の場所を切り出して小さな GML にするには `scripts/extract_gml.py 入力.gml 出力.gml 緯度 経度 半径m` を使います（建物は LOD0/LOD1 だけ、道路は区分面を残し、LOD3 の三角形メッシュは shapely があれば平面ポリゴンにまとめます）。
+
+出典: 国土交通省 Project PLATEAU 3D 都市モデル（東京都 23 区、2023 年度）を加工して作成（[PLATEAU サイトポリシー](https://www.mlit.go.jp/plateau/site-policy/)、CC BY 4.0 互換）。
 
 ### CityGML（公式配布データ）
 
@@ -110,7 +138,8 @@ ffmpeg -framerate 30 -i rec/frame_%05d.png -c:v libx264 -pix_fmt yuv420p sim.mp4
 
 - [x] MVP: CityGML 読込 → グリッド → フローフィールド → Social Force → CSV/PNG
 - [x] 実データ検証（渋谷 4 メッシュの OBJ、CityGML 抜粋）
-- [ ] CityGML LOD2/LOD3 の `tran:TrafficArea`（車道部・歩道部）を使った正確な歩道判定、横断歩道の位置
+- [x] CityGML LOD2/LOD3 の `tran:TrafficArea`（車道部・歩道部・島）を使った歩道判定（銀座で検証）
+- [ ] 横断歩道の位置（PLATEAU の道路データに横断歩道の面が無いので別データが要る）
 - [ ] シナリオ定義（TOML）: 出発地・目的地（駅出口など）・発生レート・時間帯
 - [x] 可視化: bevy で 3D 建物 + エージェントのリアルタイム表示
 - [ ] 可視化の拡張: LOD2 の屋根形状・テクスチャ、地形 (dem)、wasm + WebGPU でブラウザ表示
@@ -118,4 +147,4 @@ ffmpeg -framerate 30 -i rec/frame_%05d.png -c:v libx264 -pix_fmt yuv420p sim.mp4
 - [ ] 評価指標: 密度（人/m²）、流量、サービス水準 (LOS)、避難完了時間
 - [x] 車両: 道路網抽出、IDM、交差点の通行権、歩行者との相互作用
 - [ ] 信号機・横断歩道、車線数（多車線・右左折レーン）、駐車・路線バス
-- [ ] 歩道 (`tran:TrafficArea` の function) による正確な歩道／車道の区別、階段・建物入口の扱い
+- [ ] 階段・建物入口の扱い、歩道の植栽・街路樹（AuxiliaryTrafficArea の種別）の反映

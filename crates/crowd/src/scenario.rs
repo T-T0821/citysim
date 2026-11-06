@@ -18,7 +18,7 @@ pub fn through_traffic(
     seed: u64,
 ) -> Option<(Simulation, GoalNames)> {
     // 道路データがあれば車道を区別し、歩行者は歩道を優先する（車道横断はコスト 6 倍）
-    if grid.has_roads && grid.carriageway.is_empty() {
+    if grid.has_roads {
         grid.mark_carriageway(SIDEWALK_W, 6.0);
     }
     let on_sidewalk =

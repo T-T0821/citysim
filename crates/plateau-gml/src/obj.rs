@@ -133,6 +133,8 @@ fn finish(
         FeatureKind::Road => Some(Feature {
             kind,
             gml_id: Some(id.to_string()),
+            name: None,
+            areas: vec![],
             rings: tris
                 .iter()
                 .map(|t| t.iter().map(|v| geo(v, 0.0)).collect())
@@ -166,6 +168,8 @@ fn finish(
             Some(Feature {
                 kind,
                 gml_id: Some(id.to_string()),
+                name: None,
+                areas: vec![],
                 rings,
                 height: Some((ymax - ymin).max(0.0)),
                 solid,

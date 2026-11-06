@@ -184,6 +184,16 @@ fn main() -> Result<()> {
         grid.h as f32 * grid.cell,
         100.0 * n_walk as f32 / (grid.w * grid.h) as f32
     );
+    if grid.has_roads {
+        eprintln!(
+            "歩道/車道: {}",
+            if grid.carriageway_from_data {
+                "LOD2/LOD3 の TrafficArea（車道部・歩道部）から"
+            } else {
+                "LOD1 路面から近似（道路端 3m を歩道）"
+            }
+        );
+    }
 
     let mut traffic = if args.vehicles > 0 && grid.has_roads {
         let net = traffic::RoadGraph::from_grid(&grid, crowd::scenario::SIDEWALK_W);

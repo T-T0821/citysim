@@ -66,8 +66,10 @@ pub struct WalkGrid {
     pub buildings: Vec<Building>,
     /// 道路面データから歩行空間を作ったか
     pub has_roads: bool,
-    /// 車道セル（`mark_carriageway` で設定。未設定なら空）
+    /// 車道セル（LOD2/LOD3 の TrafficArea があれば生成時に、無ければ `mark_carriageway` で設定。未設定なら空）
     pub carriageway: Vec<bool>,
+    /// 車道・歩道の区別を PLATEAU の TrafficArea（車道部・歩道部）から取ったか
+    pub carriageway_from_data: bool,
     /// 歩行者の経路コスト倍率（車道は高くして歩道を優先させる）
     pub walk_cost: Vec<f32>,
 }
@@ -96,9 +98,23 @@ impl WalkGrid {
         let to_poly =
             |r: &Vec<GeoPoint>| -> Polygon { r.iter().map(|p| proj.to_local(p)).collect() };
         let roads: Vec<Polygon> = model
-            .roads()
+            .ground_roads()
             .flat_map(|f| f.rings.iter().map(to_poly))
             .collect();
+        // LOD2/LOD3 の道路は区分面で車道部・歩道部が分かる
+        let mut carriage_polys: Vec<Polygon> = vec![];
+        let mut sidewalk_polys: Vec<Polygon> = vec![];
+        let mut aux_polys: Vec<Polygon> = vec![];
+        for a in model.ground_roads().flat_map(|f| f.areas.iter()) {
+            let dst = if a.auxiliary {
+                &mut aux_polys
+            } else if a.is_carriageway() {
+                &mut carriage_polys
+            } else {
+                &mut sidewalk_polys
+            };
+            dst.extend(a.rings.iter().map(to_poly));
+        }
         let buildings: Vec<Building> = model
             .buildings()
             .map(|f| Building {
@@ -122,10 +138,35 @@ impl WalkGrid {
         for p in &roads {
             fill_polygon(p, Vec2::ZERO, cell, w, h, |i| walkable[i] = true);
         }
+        // 植栽・分離帯などの付属面は通れない（歩道部・車道部と重なる所は通れる方を優先）
+        for p in &aux_polys {
+            fill_polygon(p, Vec2::ZERO, cell, w, h, |i| walkable[i] = false);
+        }
+        let mut carriageway = vec![];
+        let carriageway_from_data = !carriage_polys.is_empty() || !sidewalk_polys.is_empty();
+        if carriageway_from_data {
+            let mut cw = vec![false; w * h];
+            for p in &carriage_polys {
+                fill_polygon(p, Vec2::ZERO, cell, w, h, |i| {
+                    cw[i] = true;
+                    walkable[i] = true;
+                });
+            }
+            for p in &sidewalk_polys {
+                fill_polygon(p, Vec2::ZERO, cell, w, h, |i| {
+                    cw[i] = false;
+                    walkable[i] = true;
+                });
+            }
+            carriageway = cw;
+        }
         for b in &buildings {
             for p in &b.footprint {
                 fill_polygon(p, Vec2::ZERO, cell, w, h, |i| walkable[i] = false);
             }
+        }
+        for (c, &wk) in carriageway.iter_mut().zip(&walkable) {
+            *c &= wk;
         }
         let mut g = Self {
             origin: Vec2::ZERO,
@@ -137,20 +178,23 @@ impl WalkGrid {
             projection: proj,
             buildings,
             has_roads: !roads.is_empty(),
-            carriageway: vec![],
+            carriageway,
+            carriageway_from_data,
             walk_cost: vec![1.0; w * h],
         };
         g.obstacle_dist = g.chamfer_obstacle_distance();
         Some(g)
     }
 
-    /// 道路の端（建物・道路外）から `sidewalk_w` [m] 以上離れた歩行可能セルを車道とみなす。
-    /// PLATEAU LOD1 の道路面は歩道と車道を区別しないための近似（LOD2 以降は TrafficArea で区別できる）。
-    /// 歩行者が車道を通るコストは `crossing_cost` 倍になる。
+    /// 車道セルを決め、歩行者が車道を通るコストを `crossing_cost` 倍にする。
+    /// 車道が TrafficArea（LOD2/LOD3）から分かっていればそれを使い、
+    /// LOD1 だけの道路面では「道路の端（建物・道路外）から `sidewalk_w` [m] 以上離れた歩行可能セル」を車道とみなす近似を使う。
     pub fn mark_carriageway(&mut self, sidewalk_w: f32, crossing_cost: f32) {
-        self.carriageway = (0..self.w * self.h)
-            .map(|i| self.walkable[i] && self.obstacle_dist[i] >= sidewalk_w)
-            .collect();
+        if self.carriageway.is_empty() {
+            self.carriageway = (0..self.w * self.h)
+                .map(|i| self.walkable[i] && self.obstacle_dist[i] >= sidewalk_w)
+                .collect();
+        }
         for (c, &cw) in self.walk_cost.iter_mut().zip(&self.carriageway) {
             *c = if cw { crossing_cost } else { 1.0 };
         }
