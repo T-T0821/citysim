@@ -10,3 +10,7 @@ walkmap.workspace = true
 plateau-gml.workspace = true
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+
+# wasm（Web デモ）ではスレッドが無いので逐次で計算する
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = "1"

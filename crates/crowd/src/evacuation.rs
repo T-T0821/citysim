@@ -199,10 +199,7 @@ fn compute_fields(
             }
         }
     }
-    let out = cells
-        .iter()
-        .map(|c| FlowField::compute(&sim.grid, c))
-        .collect();
+    let out = crate::par::map(cells.len(), |k| FlowField::compute(&sim.grid, &cells[k]));
     sim.grid.walk_cost = saved;
     out
 }

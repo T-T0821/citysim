@@ -30,7 +30,7 @@ pub fn through_traffic(
         ("南", Box::new(|_, y| y < 2)),
         ("北", Box::new(move |_, y| y + 3 > h)),
     ];
-    let mut flows = vec![];
+    let mut targets = vec![];
     let mut names = vec![];
     for (name, pred) in edges.iter() {
         let mut cells: Vec<_> = grid.walkable_cells().filter(|&(x, y)| pred(x, y)).collect();
@@ -40,9 +40,12 @@ pub fn through_traffic(
         if cells.is_empty() {
             continue;
         }
-        flows.push(FlowField::compute(&grid, &cells));
+        targets.push(cells);
         names.push(*name);
     }
+    // 4 方向のフローフィールドは独立なので並列に計算する
+    let flows: Vec<FlowField> =
+        crate::par::map(targets.len(), |k| FlowField::compute(&grid, &targets[k]));
     if flows.is_empty() {
         return None;
     }
@@ -53,6 +56,15 @@ pub fn through_traffic(
     if cells.iter().any(|&(x, y)| on_sidewalk(&sim.grid, x, y)) {
         cells.retain(|&(x, y)| on_sidewalk(&sim.grid, x, y));
     }
+    // 既に置いた人の近く (0.6m 以内) を避けるための格子（全員と比べると大人数で O(N²) になる）
+    const MIN_GAP: f32 = 0.6;
+    let mut placed: std::collections::HashMap<(i32, i32), Vec<Vec2>> = Default::default();
+    let key = |p: Vec2| {
+        (
+            (p.x / MIN_GAP).floor() as i32,
+            (p.y / MIN_GAP).floor() as i32,
+        )
+    };
     let mut tries = 0;
     while sim.agents.len() < n_agents && tries < n_agents * 100 {
         tries += 1;
@@ -65,13 +77,18 @@ pub fn through_traffic(
         {
             continue;
         }
-        if sim
-            .agents
-            .iter()
-            .any(|a| a.pos.distance_squared(pos) < 0.36)
-        {
+        let (kx, ky) = key(pos);
+        let crowded = (-1..=1).any(|dy| {
+            (-1..=1).any(|dx| {
+                placed
+                    .get(&(kx + dx, ky + dy))
+                    .is_some_and(|v| v.iter().any(|q| q.distance_squared(pos) < 0.36))
+            })
+        });
+        if crowded {
             continue;
         }
+        placed.entry((kx, ky)).or_default().push(pos);
         sim.agents.push(Agent {
             pos,
             vel: Vec2::ZERO,
