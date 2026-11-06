@@ -10,6 +10,9 @@ use plateau_gml::{CityModel, GeoPoint};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
+pub mod closure;
+pub use closure::ClosureKind;
+
 const EARTH_R: f64 = 6_378_137.0;
 
 /// 局所平面への等距円筒近似投影。街区〜数km 程度の範囲では十分な精度。

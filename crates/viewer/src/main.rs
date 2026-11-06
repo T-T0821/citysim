@@ -5,6 +5,7 @@
 
 mod camera;
 mod geometry;
+mod scenario;
 mod ui;
 
 use anyhow::{bail, Context, Result};
@@ -36,6 +37,9 @@ struct Args {
     orbit: f32,
     warmup: f32,
     ui_font: Option<PathBuf>,
+    scenario: Option<PathBuf>,
+    agents_given: bool,
+    vehicles_given: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -52,6 +56,9 @@ fn parse_args() -> Result<Args> {
         orbit: 0.0,
         warmup: 0.0,
         ui_font: None,
+        scenario: None,
+        agents_given: false,
+        vehicles_given: false,
         cell: 0.5,
         seed: 1,
         respawn: true,
@@ -102,8 +109,14 @@ fn parse_args() -> Result<Args> {
                 }
                 a.crop = Some((x[0], x[1], x[2]));
             }
-            "--agents" => a.agents = v()?.parse()?,
-            "--vehicles" => a.vehicles = v()?.parse()?,
+            "--agents" => {
+                a.agents = v()?.parse()?;
+                a.agents_given = true;
+            }
+            "--vehicles" => {
+                a.vehicles = v()?.parse()?;
+                a.vehicles_given = true;
+            }
             "--cell" => a.cell = v()?.parse()?,
             "--seed" => a.seed = v()?.parse()?,
             "--no-respawn" => a.respawn = false,
@@ -127,11 +140,14 @@ fn parse_args() -> Result<Args> {
             "--warmup" => a.warmup = v()?.parse()?,
             // 設定パネルの日本語フォント（省略時は OS の定番フォントを探す）
             "--ui-font" => a.ui_font = Some(v()?.into()),
+            // イベント・混雑シナリオ／通行止めの設定ファイル（TOML, scenarios/ を参照）
+            "--scenario" => a.scenario = Some(v()?.into()),
             "-h" | "--help" => {
                 println!(
                     "usage: plateau-crowd-viewer (--gml <file|dir> | --obj <file|dir> --obj-origin 緯度,経度)... [--crop 緯度,経度,半径m] [--agents N] [--vehicles N] [--cell M] [--seed N]\n\
                      \x20                          [--no-respawn] [--screenshot out.png <sim秒>]\n\
-                     \x20                          [--record <dir> <動画の秒数>] [--fps 30] [--speed 2] [--orbit rad/s] [--warmup 秒] [--ui-font font.ttf]"
+                     \x20                          [--record <dir> <動画の秒数>] [--fps 30] [--speed 2] [--orbit rad/s] [--warmup 秒] [--ui-font font.ttf]\n\
+                     \x20                          [--scenario scenario.toml]"
                 );
                 std::process::exit(0);
             }
@@ -199,27 +215,31 @@ pub struct SimState {
 }
 
 /// グリッドと道路網から歩行者・車のシミュレーションを組み立てる。
+/// シナリオの通行止めを反映し、発生源を準備する（`scen.spawner` などを更新）。
 fn build_sim(
-    grid: WalkGrid,
     road_graph: Option<&RoadGraph>,
     st: &Settings,
+    scen: &mut scenario::ScenarioState,
 ) -> Result<(Simulation, Option<Traffic>, Vec<Vec<(usize, usize)>>)> {
+    let grid = scen.closed_grid();
     let traffic = match road_graph {
         Some(net) if st.vehicles > 0 => {
             let params = traffic::Params {
                 speed_limit: st.speed_limit_kmh / 3.6,
                 ..Default::default()
             };
-            Some(Traffic::new_with(net.clone(), st.vehicles, st.seed, params))
+            let net = net.retain_edges(|e| !scen.scenario.blocks_road(&e.pts));
+            Some(Traffic::new_with(net, st.vehicles, st.seed, params))
         }
         _ => None,
     };
-    let (mut sim, _names) = crowd::scenario::through_traffic(grid, st.agents, st.seed)
+    let (mut sim, names) = crowd::scenario::through_traffic(grid, st.agents, st.seed)
         .context("範囲の縁に歩行可能領域がありません")?;
     let k = st.walk_speed / 1.34;
     for a in sim.agents.iter_mut() {
         a.desired_speed = (a.desired_speed * k).clamp(0.3, 3.0);
     }
+    // 再投入に使うのは範囲の縁（シナリオの行き先を足す前）
     let goal_cells = sim
         .goals
         .iter()
@@ -230,6 +250,16 @@ fn build_sim(
                 .collect()
         })
         .collect();
+    let mut names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+    scen.spawner = Some(
+        scen.scenario
+            .install(&mut sim, &mut names, st.seed)
+            .map_err(anyhow::Error::msg)?,
+    );
+    scen.goal_names = names;
+    scen.stats = crowd::report::ZoneStats::new(&sim.grid, scen.zone_size);
+    scen.pending = false;
+    scen.markers_dirty = true;
     Ok((sim, traffic, goal_cells))
 }
 
@@ -294,8 +324,22 @@ fn main() -> Result<()> {
         );
         net
     });
-    let settings = Settings::new(args.agents, args.vehicles, args.seed, args.respawn);
-    let (sim, traffic, goal_cells) = build_sim(grid, road_graph.as_ref(), &settings)?;
+    let mut settings = Settings::new(args.agents, args.vehicles, args.seed, args.respawn);
+    let sc = match &args.scenario {
+        Some(p) => {
+            let sc = scenario::ScenarioState::load(p, &grid).map_err(anyhow::Error::msg)?;
+            if let (Some(n), false) = (sc.background_agents, args.agents_given) {
+                settings.agents = n;
+            }
+            if let (Some(n), false) = (sc.vehicles, args.vehicles_given) {
+                settings.vehicles = n;
+            }
+            sc
+        }
+        None => crowd::event::Scenario::empty(),
+    };
+    let mut scen = scenario::ScenarioState::new(grid, sc, args.scenario.as_deref());
+    let (sim, traffic, goal_cells) = build_sim(road_graph.as_ref(), &settings, &mut scen)?;
     info!(
         "エージェント {} 人, 車 {} 台",
         sim.agents.len(),
@@ -333,6 +377,7 @@ fn main() -> Result<()> {
     })
     .insert_resource(state)
     .insert_resource(settings)
+    .insert_resource(scen)
     .insert_resource(UiFont(args.ui_font.clone()))
     .init_resource::<camera::UiCapture>()
     .add_plugins(bevy_egui::EguiPlugin {
@@ -344,10 +389,14 @@ fn main() -> Result<()> {
         (
             install_ui_font,
             ui::settings_panel,
+            scenario::scenario_panel,
+            scenario::place_on_map,
             apply_settings,
             camera::orbit_camera,
             controls,
             step_sim,
+            spawn_new_agents,
+            scenario::sync_markers,
             sync_agents,
             sync_cars,
             update_heat,
@@ -533,11 +582,16 @@ fn setup(
         Color::srgb(0.15, 0.45, 0.90),
         Color::srgb(0.95, 0.70, 0.10),
         Color::srgb(0.20, 0.70, 0.35),
+        // シナリオの行き先
+        Color::srgb(0.75, 0.25, 0.85),
+        Color::srgb(0.10, 0.80, 0.80),
+        Color::srgb(0.95, 0.45, 0.70),
+        Color::srgb(0.55, 0.35, 0.15),
     ];
-    let goal_materials: Vec<_> = (0..state.sim.goals.len())
+    let goal_materials: Vec<_> = (0..palette.len())
         .map(|i| {
             materials.add(StandardMaterial {
-                base_color: palette[i % 4],
+                base_color: palette[i],
                 ..default()
             })
         })
@@ -612,7 +666,7 @@ fn spawn_entities(
         commands.spawn((
             AgentVis(i),
             Mesh3d(visuals.body.clone()),
-            MeshMaterial3d(visuals.goal_materials[a.goal].clone()),
+            MeshMaterial3d(visuals.goal_materials[a.goal % visuals.goal_materials.len()].clone()),
             Transform::from_translation(to_world(a.pos, 0.82)),
         ));
     }
@@ -683,6 +737,7 @@ fn apply_settings(
     mut meshes: ResMut<Assets<Mesh>>,
     mut settings: ResMut<Settings>,
     mut state: ResMut<SimState>,
+    mut scen: ResMut<scenario::ScenarioState>,
     visuals: Res<Visuals>,
     agents: Query<Entity, With<AgentVis>>,
     cars: Query<Entity, With<CarVis>>,
@@ -692,7 +747,7 @@ fn apply_settings(
     }
     settings.apply_requested = false;
     let st = &mut *state;
-    match build_sim(st.sim.grid.clone(), st.road_graph.as_ref(), &settings) {
+    match build_sim(st.road_graph.as_ref(), &settings, &mut scen) {
         Ok((sim, traffic, goal_cells)) => {
             st.sim = sim;
             st.traffic = traffic;
@@ -700,6 +755,7 @@ fn apply_settings(
         }
         Err(e) => {
             error!("作り直しに失敗: {e:#}");
+            scen.message = format!("作り直しに失敗: {e:#}");
             return;
         }
     }
@@ -761,6 +817,8 @@ fn controls(
 fn step_sim(
     time: Res<Time>,
     mut state: ResMut<SimState>,
+    mut scen: ResMut<scenario::ScenarioState>,
+    settings: Res<Settings>,
     shot: Option<Res<ScreenshotPlan>>,
     rec: Option<Res<RecordPlan>>,
     frames: Res<bevy::diagnostic::FrameCount>,
@@ -769,6 +827,9 @@ fn step_sim(
     if st.paused {
         return;
     }
+    let scen = &mut *scen;
+    let k = settings.walk_speed / 1.34;
+    let mut advance = |st: &mut SimState| advance(st, scen, k);
     if let Some(r) = rec {
         // 録画モード: 描画速度に関係なく 1 フレーム = sim_per_frame 秒
         if frames.0 < RECORD_WARMUP || r.idx >= r.frames {
@@ -802,7 +863,7 @@ fn step_sim(
     }
 }
 
-fn advance(st: &mut SimState) {
+fn advance(st: &mut SimState, scen: &mut scenario::ScenarioState, speed_scale: f32) {
     {
         if let Some(t) = st.traffic.as_mut() {
             let peds: Vec<Vec2> = st
@@ -815,7 +876,15 @@ fn advance(st: &mut SimState) {
             t.step(DT, &peds);
             st.sim.obstacles = t.obstacles();
         }
+        scen.before_step(&mut st.sim, DT, speed_scale);
         st.sim.step(DT);
+        scen.stats.record(
+            &st.sim,
+            st.traffic
+                .iter()
+                .flat_map(|t| t.vehicles.iter().map(|v| (v.pos, v.active))),
+            DT,
+        );
         for a in st.sim.agents.iter() {
             if !a.arrived {
                 if let Some((x, y)) = st.sim.grid.cell_of(a.pos) {
@@ -826,18 +895,19 @@ fn advance(st: &mut SimState) {
         }
         st.heat_dirty = true;
         if st.respawn {
-            respawn_arrived(st);
+            let limit = scen.background_limit(st.sim.agents.len());
+            respawn_arrived(st, limit);
         }
     }
 }
 
-/// 到着した人を別の縁から再投入し、定常的な人の流れを作る。
-fn respawn_arrived(st: &mut SimState) {
-    let n_goals = st.sim.goals.len();
+/// 到着した人を別の縁から再投入し、定常的な人の流れを作る（シナリオの発生源の人 `limit..` は除く）。
+fn respawn_arrived(st: &mut SimState, limit: usize) {
+    let n_goals = st.goal_cells.len();
     if n_goals < 2 {
         return;
     }
-    for i in 0..st.sim.agents.len() {
+    for i in 0..limit {
         if !st.sim.agents[i].arrived {
             continue;
         }
@@ -857,6 +927,25 @@ fn respawn_arrived(st: &mut SimState) {
         a.vel = Vec2::ZERO;
         a.goal = to;
         a.arrived = false;
+    }
+}
+
+/// シナリオの発生源で増えた歩行者の表示を足す。
+fn spawn_new_agents(
+    mut commands: Commands,
+    state: Res<SimState>,
+    visuals: Res<Visuals>,
+    q: Query<&AgentVis>,
+) {
+    let have = q.iter().count();
+    for (i, a) in state.sim.agents.iter().enumerate().skip(have) {
+        commands.spawn((
+            AgentVis(i),
+            Mesh3d(visuals.body.clone()),
+            MeshMaterial3d(visuals.goal_materials[a.goal % visuals.goal_materials.len()].clone()),
+            Transform::from_translation(to_world(a.pos, 0.82)),
+            if a.arrived { Visibility::Hidden } else { Visibility::Inherited },
+        ));
     }
 }
 
@@ -883,8 +972,9 @@ fn sync_agents(
             *vis = want;
         }
         tf.translation = to_world(a.pos, 0.82);
-        if mat.0 != visuals.goal_materials[a.goal] {
-            mat.0 = visuals.goal_materials[a.goal].clone();
+        let m = &visuals.goal_materials[a.goal % visuals.goal_materials.len()];
+        if mat.0 != *m {
+            mat.0 = m.clone();
         }
     }
 }
@@ -911,6 +1001,7 @@ fn sync_cars(state: Res<SimState>, mut q: Query<(&CarVis, &mut Transform, &mut V
 
 fn update_heat(
     mut state: ResMut<SimState>,
+    scen: Res<scenario::ScenarioState>,
     visuals: Res<Visuals>,
     mut images: ResMut<Assets<Image>>,
     overlay: Query<&Visibility, With<HeatOverlay>>,
@@ -928,6 +1019,10 @@ fn update_heat(
     let Some(data) = img.data.as_mut() else {
         return;
     };
+    if scen.diff_view {
+        scenario::diff_pixels(&scen, g, data);
+        return;
+    }
     for y in 0..g.h {
         for x in 0..g.w {
             let v = state.heat[g.idx(x, y)];

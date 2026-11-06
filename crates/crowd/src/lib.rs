@@ -5,6 +5,9 @@
 //! - 他者からの反発: 指数関数的な心理的反発 + 接触時の物理力
 //! - 壁からの反発: 障害物距離場の勾配方向
 
+pub mod event;
+pub mod png;
+pub mod report;
 pub mod scenario;
 
 use glam::Vec2;
