@@ -59,6 +59,9 @@ pub struct Simulation {
     pub time: f32,
     /// 動く障害物（車両など）: カプセルの端点 2 つと半径。毎ステップ外から更新する。
     pub obstacles: Vec<(Vec2, Vec2, f32)>,
+    /// 歩道から踏み出してはいけないセル（赤信号の横断歩道など）。空なら制限なし。
+    /// 車道上にいる人（渡っている途中の人）は対象外で、そのまま渡り切る。
+    pub closed: Vec<bool>,
     hash: SpatialHash,
 }
 
@@ -72,8 +75,38 @@ impl Simulation {
             params,
             time: 0.0,
             obstacles: vec![],
+            closed: vec![],
             hash,
         }
+    }
+
+    /// `grid.walk_cost` を変えたあとに、各目的地のフローフィールドを作り直す。
+    pub fn recompute_flows(&mut self) {
+        for ff in self.goals.iter_mut() {
+            let cells: Vec<_> = self
+                .grid
+                .walkable_cells()
+                .filter(|&(x, y)| ff.dist[self.grid.idx(x, y)] == 0.0)
+                .collect();
+            *ff = FlowField::compute(&self.grid, &cells);
+        }
+    }
+
+    /// p のセルが `closed` か
+    fn is_closed(&self, p: Vec2) -> bool {
+        !self.closed.is_empty()
+            && self
+                .grid
+                .cell_of(p)
+                .is_some_and(|(x, y)| self.closed[self.grid.idx(x, y)])
+    }
+
+    /// from にいる人が to へ踏み出すのを止めるか（歩道上から閉じたセルへ）
+    fn gated(&self, from: Vec2, to: Vec2) -> bool {
+        !self.closed.is_empty()
+            && !self.grid.is_carriageway(from)
+            && !self.is_closed(from)
+            && self.is_closed(to)
     }
 
     pub fn active(&self) -> usize {
@@ -92,7 +125,13 @@ impl Simulation {
             }
             let ff = &self.goals[a.goal];
             let e = ff.direction(&self.grid, a.pos).unwrap_or(Vec2::ZERO);
-            let mut f = (e * a.desired_speed - a.vel) / p.tau;
+            // 赤信号の横断歩道の手前では立ち止まって待つ
+            let speed = if self.gated(a.pos, a.pos + e * (a.radius + 0.5)) {
+                0.0
+            } else {
+                a.desired_speed
+            };
+            let mut f = (e * speed - a.vel) / p.tau;
 
             // 他者
             self.hash.for_neighbors(a.pos, |j| {
@@ -156,7 +195,8 @@ impl Simulation {
             acc[i] = f;
         }
 
-        for (a, f) in self.agents.iter_mut().zip(acc) {
+        let mut agents = std::mem::take(&mut self.agents);
+        for (a, f) in agents.iter_mut().zip(acc) {
             if a.arrived {
                 continue;
             }
@@ -166,16 +206,18 @@ impl Simulation {
                 a.vel = a.vel.normalize() * vmax;
             }
             let next = a.pos + a.vel * dt;
+            let from = a.pos;
+            let ok = |q: Vec2| self.grid.is_walkable(q) && !self.gated(from, q);
             // 数値的に壁へめり込んだら軸ごとに止める
-            if self.grid.is_walkable(next) {
+            if ok(next) {
                 a.pos = next;
             } else {
                 let nx = Vec2::new(next.x, a.pos.y);
                 let ny = Vec2::new(a.pos.x, next.y);
-                if self.grid.is_walkable(nx) {
+                if ok(nx) {
                     a.pos = nx;
                     a.vel.y = 0.0;
-                } else if self.grid.is_walkable(ny) {
+                } else if ok(ny) {
                     a.pos = ny;
                     a.vel.x = 0.0;
                 } else {
@@ -186,6 +228,7 @@ impl Simulation {
                 a.arrived = true;
             }
         }
+        self.agents = agents;
         self.time += dt;
     }
 }
@@ -293,5 +336,46 @@ mod tests {
         }
         assert_eq!(sim.active(), 0, "全員が 300 秒以内に到着すること");
         assert!(sim.agents.iter().all(|a| sim.grid.is_walkable(a.pos)));
+    }
+
+    #[test]
+    fn pedestrians_wait_at_closed_cells() {
+        let m = plateau_gml::parse_str(include_str!("../../../testdata/sample.gml")).unwrap();
+        let mut g = WalkGrid::from_city(&m, 0.5).unwrap();
+        g.mark_carriageway(3.0, 6.0);
+        let goal: Vec<_> = g.walkable_cells().filter(|&(x, _)| x + 3 >= g.w).collect();
+        let ff = FlowField::compute(&g, &goal);
+        let n = g.w * g.h;
+        let mut sim = Simulation::new(g, vec![ff], Params::default());
+        // 車道をすべて閉じる: 歩道上の人は車道へ出られない
+        sim.closed = sim.grid.carriageway.clone();
+        assert_eq!(sim.closed.len(), n);
+        let mut rng = Rng::new(3);
+        while sim.agents.len() < 30 {
+            let p = Vec2::new(rng.range(1.0, 60.0), rng.range(61.0, 79.0));
+            if sim.grid.obstacle_sample(p).0 > 0.4 && !sim.grid.is_carriageway(p) {
+                sim.agents.push(Agent {
+                    pos: p,
+                    vel: Vec2::ZERO,
+                    radius: 0.25,
+                    desired_speed: 1.34,
+                    goal: 0,
+                    arrived: false,
+                });
+            }
+        }
+        for _ in 0..1200 {
+            sim.step(0.05);
+            assert!(
+                sim.agents.iter().all(|a| !sim.grid.is_carriageway(a.pos)),
+                "閉じた車道に入らない"
+            );
+        }
+        // 開ければ渡れる
+        sim.closed.iter_mut().for_each(|c| *c = false);
+        for _ in 0..(300.0 / 0.05) as usize {
+            sim.step(0.05);
+        }
+        assert_eq!(sim.active(), 0);
     }
 }

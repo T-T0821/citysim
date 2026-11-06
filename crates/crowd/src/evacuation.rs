@@ -84,6 +84,8 @@ impl Evacuation {
             return None;
         }
         let fields = compute_fields(sim, &all_cells, p.carriageway_cost, &[]);
+        // 避難中は信号待ちをしない（車は止まる）
+        sim.closed.clear();
         sim.goals.extend(fields);
         let mut total = 0;
         let mut unreachable = 0;
