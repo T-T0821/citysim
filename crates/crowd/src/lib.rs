@@ -84,15 +84,16 @@ impl Simulation {
     }
 
     /// `grid.walk_cost` を変えたあとに、各目的地のフローフィールドを作り直す。
+    /// 目的地ごとの計算は独立なので並列に行う。
     pub fn recompute_flows(&mut self) {
-        for ff in self.goals.iter_mut() {
-            let cells: Vec<_> = self
-                .grid
+        let (grid, goals) = (&self.grid, &self.goals);
+        self.goals = par::map(goals.len(), |k| {
+            let cells: Vec<_> = grid
                 .walkable_cells()
-                .filter(|&(x, y)| ff.dist[self.grid.idx(x, y)] == 0.0)
+                .filter(|&(x, y)| goals[k].dist[grid.idx(x, y)] == 0.0)
                 .collect();
-            *ff = FlowField::compute(&self.grid, &cells);
-        }
+            FlowField::compute(grid, &cells)
+        });
     }
 
     /// p のセルが `closed` か
@@ -118,13 +119,12 @@ impl Simulation {
 
     pub fn step(&mut self, dt: f32) {
         let p = &self.params;
-        self.hash
-            .rebuild(self.agents.iter().map(|a| (a.pos, !a.arrived)));
+        self.hash.rebuild(&self.agents);
         let mut acc = vec![Vec2::ZERO; self.agents.len()];
 
-        for (i, a) in self.agents.iter().enumerate() {
+        let force = |i: usize, a: &Agent| -> Vec2 {
             if a.arrived {
-                continue;
+                return Vec2::ZERO;
             }
             let ff = &self.goals[a.goal];
             let e = ff.direction(&self.grid, a.pos).unwrap_or(Vec2::ZERO);
@@ -136,19 +136,18 @@ impl Simulation {
             };
             let mut f = (e * speed - a.vel) / p.tau;
 
-            // 他者
-            self.hash.for_neighbors(a.pos, |j| {
+            // 他者（近傍 3x3 区画。区画内は番号順に並んでいるので、合計の順序も番号順）
+            self.hash.for_neighbors(a.pos, |j, bpos, brad| {
                 if j == i {
                     return;
                 }
-                let b = &self.agents[j];
-                let d = a.pos - b.pos;
+                let d = a.pos - bpos;
                 let dist = d.length().max(1e-4);
                 if dist > p.interaction_range {
                     return;
                 }
                 let n = d / dist;
-                let r = a.radius + b.radius;
+                let r = a.radius + brad;
                 let overlap = r - dist;
                 // 前方の相手ほど強く意識する
                 let cos_phi = e.dot(-n);
@@ -170,11 +169,20 @@ impl Simulation {
             }
             // 車両など動く障害物（壁より強く、少し遠くから避ける）
             for &(oa, ob, r) in &self.obstacles {
+                // 端点の外接矩形で先に弾く（ほとんどの車は遠い）
+                let reach = r + 3.0;
+                if a.pos.x < oa.x.min(ob.x) - reach
+                    || a.pos.x > oa.x.max(ob.x) + reach
+                    || a.pos.y < oa.y.min(ob.y) - reach
+                    || a.pos.y > oa.y.max(ob.y) + reach
+                {
+                    continue;
+                }
                 let ab = ob - oa;
                 let t = ((a.pos - oa).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
                 let d = a.pos - (oa + ab * t);
                 let dist = d.length();
-                if dist > r + 3.0 {
+                if dist > reach {
                     continue;
                 }
                 let Some(n) = d.try_normalize() else { continue };
@@ -195,84 +203,199 @@ impl Simulation {
                     f += axis * side * (ahead * a.desired_speed / p.tau);
                 }
             }
-            acc[i] = f;
-        }
+            f
+        };
+        par::for_each_mut(&mut acc, |i, out| *out = force(i, &self.agents[i]));
 
         let mut agents = std::mem::take(&mut self.agents);
-        for (a, f) in agents.iter_mut().zip(acc) {
-            if a.arrived {
-                continue;
-            }
-            a.vel += f * dt;
-            let vmax = a.desired_speed * p.max_speed_factor;
-            if a.vel.length() > vmax {
-                a.vel = a.vel.normalize() * vmax;
-            }
-            let next = a.pos + a.vel * dt;
-            let from = a.pos;
-            let ok = |q: Vec2| self.grid.is_walkable(q) && !self.gated(from, q);
-            // 数値的に壁へめり込んだら軸ごとに止める
-            if ok(next) {
-                a.pos = next;
-            } else {
-                let nx = Vec2::new(next.x, a.pos.y);
-                let ny = Vec2::new(a.pos.x, next.y);
-                if ok(nx) {
-                    a.pos = nx;
-                    a.vel.y = 0.0;
-                } else if ok(ny) {
-                    a.pos = ny;
-                    a.vel.x = 0.0;
-                } else {
-                    a.vel = Vec2::ZERO;
-                }
-            }
-            if self.goals[a.goal].distance(&self.grid, a.pos) < 1.0 {
-                a.arrived = true;
-            }
-        }
+        let this = &*self;
+        par::for_each_mut(&mut agents, |i, a| this.integrate(a, acc[i], dt));
         self.agents = agents;
         self.time += dt;
+    }
+
+    /// 力 f で 1 ステップ動かす（壁・閉じたセルにはめり込まない）。
+    fn integrate(&self, a: &mut Agent, f: Vec2, dt: f32) {
+        if a.arrived {
+            return;
+        }
+        let p = &self.params;
+        a.vel += f * dt;
+        let vmax = a.desired_speed * p.max_speed_factor;
+        if a.vel.length() > vmax {
+            a.vel = a.vel.normalize() * vmax;
+        }
+        let next = a.pos + a.vel * dt;
+        let from = a.pos;
+        let ok = |q: Vec2| self.grid.is_walkable(q) && !self.gated(from, q);
+        // 数値的に壁へめり込んだら軸ごとに止める
+        if ok(next) {
+            a.pos = next;
+        } else {
+            let nx = Vec2::new(next.x, a.pos.y);
+            let ny = Vec2::new(a.pos.x, next.y);
+            if ok(nx) {
+                a.pos = nx;
+                a.vel.y = 0.0;
+            } else if ok(ny) {
+                a.pos = ny;
+                a.vel.x = 0.0;
+            } else {
+                a.vel = Vec2::ZERO;
+            }
+        }
+        if self.goals[a.goal].distance(&self.grid, a.pos) < 1.0 {
+            a.arrived = true;
+        }
+    }
+}
+
+/// 並列化（ネイティブは rayon、wasm などスレッドの無い環境では逐次）。
+/// 各要素の計算が独立なので、どちらでも結果は同じ。
+pub mod par {
+    /// 十分な量があるときだけスレッドに分ける（少人数ではかえって遅い）
+    const MIN_PAR: usize = 512;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn for_each_mut<T: Send>(v: &mut [T], f: impl Fn(usize, &mut T) + Sync + Send) {
+        use rayon::prelude::*;
+        if v.len() >= MIN_PAR {
+            v.par_iter_mut()
+                .with_min_len(128)
+                .enumerate()
+                .for_each(|(i, x)| f(i, x));
+        } else {
+            v.iter_mut().enumerate().for_each(|(i, x)| f(i, x));
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn for_each_mut<T: Send>(v: &mut [T], f: impl Fn(usize, &mut T) + Sync + Send) {
+        v.iter_mut().enumerate().for_each(|(i, x)| f(i, x));
+    }
+
+    /// `0..n` を並列に map して Vec にする（順序は保つ）
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn map<R: Send>(n: usize, f: impl Fn(usize) -> R + Sync + Send) -> Vec<R> {
+        use rayon::prelude::*;
+        (0..n).into_par_iter().map(f).collect()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn map<R: Send>(n: usize, f: impl Fn(usize) -> R + Sync + Send) -> Vec<R> {
+        (0..n).map(f).collect()
     }
 }
 
 /// 一様グリッドによる近傍探索。
+///
+/// 区画ごとに番号順で詰めた配列（CSR）にし、位置・半径も同じ順に並べて持つ。
+/// 横に並ぶ 3 区画は配列上で連続するので、近傍 3x3 区画は連続した 3 区間を舐めるだけで済む。
 struct SpatialHash {
     cell: f32,
-    map: std::collections::HashMap<(i32, i32), Vec<usize>>,
+    /// 区画の範囲（エージェントの外接矩形に合わせて毎回決める）
+    x0: i32,
+    y0: i32,
+    nx: i32,
+    ny: i32,
+    /// 区画 c の要素は `ids[start[c]..start[c + 1]]`
+    start: Vec<u32>,
+    ids: Vec<u32>,
+    pos: Vec<glam::Vec2>,
+    rad: Vec<f32>,
+    key: Vec<u32>,
 }
 
 impl SpatialHash {
     fn new(cell: f32) -> Self {
         Self {
             cell,
-            map: Default::default(),
+            x0: 0,
+            y0: 0,
+            nx: 0,
+            ny: 0,
+            start: vec![],
+            ids: vec![],
+            pos: vec![],
+            rad: vec![],
+            key: vec![],
         }
     }
-    fn key(&self, p: Vec2) -> (i32, i32) {
+    fn coord(&self, p: Vec2) -> (i32, i32) {
         (
             (p.x / self.cell).floor() as i32,
             (p.y / self.cell).floor() as i32,
         )
     }
-    fn rebuild(&mut self, pts: impl Iterator<Item = (Vec2, bool)>) {
-        for v in self.map.values_mut() {
-            v.clear();
+    fn rebuild(&mut self, agents: &[Agent]) {
+        let (mut lo, mut hi) = ((i32::MAX, i32::MAX), (i32::MIN, i32::MIN));
+        for a in agents.iter().filter(|a| !a.arrived) {
+            let (x, y) = self.coord(a.pos);
+            lo = (lo.0.min(x), lo.1.min(y));
+            hi = (hi.0.max(x), hi.1.max(y));
         }
-        for (i, (p, on)) in pts.enumerate() {
-            if on {
-                let k = self.key(p);
-                self.map.entry(k).or_default().push(i);
+        self.ids.clear();
+        self.pos.clear();
+        self.rad.clear();
+        if lo.0 > hi.0 {
+            self.nx = 0;
+            self.ny = 0;
+            return;
+        }
+        (self.x0, self.y0) = (lo.0, lo.1);
+        (self.nx, self.ny) = (hi.0 - lo.0 + 1, hi.1 - lo.1 + 1);
+        let n_cells = (self.nx * self.ny) as usize;
+        self.start.clear();
+        self.start.resize(n_cells + 1, 0);
+        self.key.clear();
+        for a in agents {
+            let k = if a.arrived {
+                u32::MAX
+            } else {
+                let (x, y) = self.coord(a.pos);
+                ((y - self.y0) * self.nx + (x - self.x0)) as u32
+            };
+            self.key.push(k);
+            if k != u32::MAX {
+                self.start[k as usize + 1] += 1;
             }
         }
+        for c in 0..n_cells {
+            self.start[c + 1] += self.start[c];
+        }
+        let total = self.start[n_cells] as usize;
+        self.ids.resize(total, 0);
+        self.pos.resize(total, Vec2::ZERO);
+        self.rad.resize(total, 0.0);
+        // 番号順に詰める（区画内の順序が番号順になる）
+        let mut fill = self.start[..n_cells].to_vec();
+        for (i, a) in agents.iter().enumerate() {
+            let k = self.key[i];
+            if k == u32::MAX {
+                continue;
+            }
+            let s = &mut fill[k as usize];
+            let at = *s as usize;
+            *s += 1;
+            self.ids[at] = i as u32;
+            self.pos[at] = a.pos;
+            self.rad[at] = a.radius;
+        }
     }
-    fn for_neighbors(&self, p: Vec2, mut f: impl FnMut(usize)) {
-        let (kx, ky) = self.key(p);
-        for dy in -1..=1 {
-            for dx in -1..=1 {
-                if let Some(v) = self.map.get(&(kx + dx, ky + dy)) {
-                    v.iter().for_each(|&j| f(j));
-                }
+    fn for_neighbors(&self, p: Vec2, mut f: impl FnMut(usize, Vec2, f32)) {
+        let (kx, ky) = self.coord(p);
+        let (cx, cy) = (kx - self.x0, ky - self.y0);
+        let xa = (cx - 1).max(0);
+        let xb = (cx + 1).min(self.nx - 1);
+        if xa > xb {
+            return;
+        }
+        for y in (cy - 1).max(0)..=(cy + 1).min(self.ny - 1) {
+            let row = y * self.nx;
+            let s = self.start[(row + xa) as usize] as usize;
+            let e = self.start[(row + xb + 1) as usize] as usize;
+            for k in s..e {
+                f(self.ids[k] as usize, self.pos[k], self.rad[k]);
             }
         }
     }
@@ -339,6 +462,50 @@ mod tests {
         }
         assert_eq!(sim.active(), 0, "全員が 300 秒以内に到着すること");
         assert!(sim.agents.iter().all(|a| sim.grid.is_walkable(a.pos)));
+    }
+
+    #[test]
+    fn spatial_hash_finds_all_neighbors_in_index_order() {
+        let mut rng = Rng::new(11);
+        let agents: Vec<Agent> = (0..2000)
+            .map(|i| Agent {
+                pos: Vec2::new(rng.range(-40.0, 60.0), rng.range(-30.0, 30.0)),
+                vel: Vec2::ZERO,
+                radius: 0.25,
+                desired_speed: 1.34,
+                goal: 0,
+                arrived: i % 7 == 0,
+            })
+            .collect();
+        let range = 2.5;
+        let mut h = SpatialHash::new(range);
+        h.rebuild(&agents);
+        for a in agents.iter().step_by(13) {
+            let mut got = vec![];
+            h.for_neighbors(a.pos, |j, p, r| {
+                assert_eq!(p, agents[j].pos);
+                assert_eq!(r, agents[j].radius);
+                if a.pos.distance(p) <= range {
+                    got.push(j);
+                }
+            });
+            let want: Vec<usize> = (0..agents.len())
+                .filter(|&j| !agents[j].arrived && a.pos.distance(agents[j].pos) <= range)
+                .collect();
+            got.sort_unstable();
+            assert_eq!(got, want);
+        }
+        // 全員到着していても落ちない
+        let done: Vec<Agent> = agents
+            .iter()
+            .cloned()
+            .map(|mut a| {
+                a.arrived = true;
+                a
+            })
+            .collect();
+        h.rebuild(&done);
+        h.for_neighbors(Vec2::ZERO, |_, _, _| panic!("誰もいない"));
     }
 
     #[test]

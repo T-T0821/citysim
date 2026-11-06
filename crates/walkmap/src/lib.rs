@@ -356,6 +356,12 @@ impl FlowField {
             (-1, 1, std::f32::consts::SQRT_2),
             (-1, -1, std::f32::consts::SQRT_2),
         ];
+        // 壁際の上乗せはセルごとに 1 回だけ計算しておく（緩和のたびに exp を呼ばない）
+        let wall_pen: Vec<f32> = grid
+            .obstacle_dist
+            .iter()
+            .map(|&od| 1.0 + 2.0 * (-od / 1.0).exp())
+            .collect();
         while let Some(Node(d, i)) = heap.pop() {
             if d > dist[i] {
                 continue;
@@ -378,8 +384,7 @@ impl FlowField {
                 {
                     continue;
                 }
-                let wall_pen = 1.0 + 2.0 * (-grid.obstacle_dist[j] / 1.0).exp();
-                let nd = d + len * grid.cell * wall_pen * grid.walk_cost[j];
+                let nd = d + len * grid.cell * wall_pen[j] * grid.walk_cost[j];
                 if nd < dist[j] {
                     dist[j] = nd;
                     heap.push(Node(nd, j));

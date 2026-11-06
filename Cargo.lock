@@ -1777,6 +1777,7 @@ version = "0.1.0"
 dependencies = [
  "glam",
  "plateau-gml",
+ "rayon",
  "serde",
  "toml",
  "walkmap",

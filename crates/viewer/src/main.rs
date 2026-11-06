@@ -24,6 +24,8 @@ use ui::Settings;
 use walkmap::WalkGrid;
 
 const DT: f32 = 0.05;
+/// 通常表示で 1 フレームに計算へ使ってよい時間 [s]
+const FRAME_SIM_BUDGET: f32 = 0.025;
 
 struct Args {
     gml: Vec<PathBuf>,
@@ -744,7 +746,13 @@ fn setup(
             })
         })
         .collect();
-    let body = meshes.add(Capsule3d::new(0.22, 1.2));
+    // 何千人も並ぶので分割を粗くして頂点数を抑える（既定の 1/10 程度）
+    let body = meshes.add(
+        Capsule3d::new(0.22, 1.2)
+            .mesh()
+            .latitudes(6)
+            .longitudes(12),
+    );
     let visuals = Visuals {
         goal_materials,
         heat_image,
@@ -1103,6 +1111,7 @@ fn step_sim(
         }
         return;
     }
+    let realtime = shot.is_none();
     // スクリーンショットモードでは描画速度に関係なく決まった時刻まで一気に進める
     let mut budget = match shot {
         Some(s) if st.sim.time < s.at => ((s.at - st.sim.time) / DT).ceil() as usize,
@@ -1114,9 +1123,16 @@ fn step_sim(
             n.min(40)
         }
     };
+    // 通常表示では 1 フレームに計算へ使う時間を区切る。大人数で追いつかないときは
+    // 描画を止めずに計算の方を遅らせる（積み残しは捨てる）
+    let started = bevy::platform::time::Instant::now();
     while budget > 0 {
         budget -= 1;
         advance(st);
+        if realtime && started.elapsed().as_secs_f32() > FRAME_SIM_BUDGET {
+            st.acc = 0.0;
+            break;
+        }
     }
 }
 
@@ -1240,7 +1256,11 @@ fn sync_agents(
         if *vis != want {
             *vis = want;
         }
-        tf.translation = to_world(a.pos, 0.82);
+        // 変わらないものに書き込むと変更扱いになり、変換の伝播・GPU 転送が毎フレーム走る
+        let t = to_world(a.pos, 0.82);
+        if !a.arrived && tf.translation != t {
+            tf.translation = t;
+        }
         let want = visuals.agent_mat(a.goal, state.evac_goals());
         if mat.0 != want {
             mat.0 = want;
