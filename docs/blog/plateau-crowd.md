@@ -6,9 +6,15 @@ topics: ["rust", "plateau", "bevy", "simulation", "citygml"]
 published: false
 ---
 
+<!--
+画像について: 記事中の画像は ./ginza.gif のような相対パスになっています。
+Zenn / Qiita の編集画面で同じ名前のファイルをアップロードし、表示された URL に差し替えてください。
+- ginza.gif, ginza-map-heatmap.png, shibuya.gif, ginza-closeup.gif, viewer-settings.png
+-->
+
 国土交通省の [Project PLATEAU](https://www.mlit.go.jp/plateau/) が公開している 3D 都市モデル（CityGML）を読み込んで、その上で歩行者と車を動かすシミュレーターを pure Rust で作りました。
 
-![銀座 4 丁目交差点を俯瞰したシミュレーションの GIF](https://raw.githubusercontent.com/T-T0821/citysim/main/docs/blog/ginza.gif)
+![銀座 4 丁目交差点を俯瞰したシミュレーションの GIF](./ginza.gif)
 *銀座 4 丁目交差点（和光・三越前）周辺 440m 四方。PLATEAU の建物 378 棟と LOD3 の道路の上を、歩行者 1500 人と車 40 台が動いています*
 
 リポジトリ: https://github.com/T-T0821/citysim
@@ -116,7 +122,7 @@ PLATEAU の座標系は EPSG:6697（JGD2011 の緯度・経度 + 標高）で、
 
 これを 0.5m グリッドに塗り分けると、次の左図のような「歩行空間の地図」が自動でできます。明るい灰色が歩道部、暗い灰色が車道部、白線と赤い点は後で説明する車道の中心線と交差点です。右図は歩行者 1000 人を 300 秒流したときの通行量ヒートマップです。
 
-![銀座の歩行空間の地図と通行量ヒートマップ](https://raw.githubusercontent.com/T-T0821/citysim/main/docs/blog/ginza-map-heatmap.png)
+![銀座の歩行空間の地図と通行量ヒートマップ](./ginza-map-heatmap.png)
 *左: TrafficArea から作った歩道（明灰）・車道（暗灰）と抽出した道路網。右: 通行量ヒートマップ*
 
 一方、LOD1 しかない道路は道路全体が 1 枚の面で、歩道と車道の区別がありません。その場合は「道路の端（建物や道路外）から 3m 以内を歩道、それより内側を車道」とみなす近似で代用しています。
@@ -176,7 +182,7 @@ if overlap > 0.0 {
 
 車を走らせるには道路の「線」（グラフ）が要りますが、PLATEAU の道路は面のデータです。そこで、車道セルの 2 値画像を **Zhang–Suen 法で細線化** し、その骨格をたどって交差点ノードと道路区間のグラフを作りました。範囲の縁で途切れる道路は出入口になります。
 
-![渋谷スクランブル交差点のシミュレーション GIF](https://raw.githubusercontent.com/T-T0821/citysim/main/docs/blog/shibuya.gif)
+![渋谷スクランブル交差点のシミュレーション GIF](./shibuya.gif)
 *渋谷スクランブル交差点（PLATEAU SDK for Unity の OBJ 書き出しを読み込み）。歩行者 1500 人・車 30 台*
 
 ### 縦方向は Intelligent Driver Model
@@ -214,12 +220,12 @@ fn idm(v: f32, v0: f32, gap: f32, dv: f32, p: &Params) -> f32 {
 
 ビューアは bevy 0.16 で作っています。建物は LOD0 のフットプリントを計測高さまで押し出し、歩行者は目的地ごとに色分けした小さな柱、車は乗用車（4.5m）とトラック（7.5m、1 割）です。
 
-![銀座 4 丁目交差点の寄りの GIF](https://raw.githubusercontent.com/T-T0821/citysim/main/docs/blog/ginza-closeup.gif)
+![銀座 4 丁目交差点の寄りの GIF](./ginza-closeup.gif)
 *和光の角。歩行者は歩道部を歩き、車道は交差点付近で横断しています*
 
 右側の設定パネルは bevy_egui です。歩行者数・車両数・平均歩行速度・制限速度・乱数シードを変えて「適用して最初から」で作り直せます。
 
-![設定パネル](https://raw.githubusercontent.com/T-T0821/citysim/main/docs/blog/viewer-settings.png)
+![設定パネル](./viewer-settings.png)
 
 記事の GIF は、ビューアの録画モードで撮っています。`--record <出力先> <秒数>` を付けると、描画速度に関係なく **1 フレーム = 一定のシミュレーション時間** で進めて連番 PNG を保存します。
 
