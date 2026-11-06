@@ -87,6 +87,9 @@ impl RoadGraph {
         let mut g = trace(&skel, grid);
         let prune_len = 2.5 * sidewalk_w.max(3.0) + 6.0;
         g.cleanup(prune_len);
+        // 広い交差点では細線化がいくつもの節点に割れるので、近い節点をまとめて 1 つの交差点にする
+        g.merge_close_nodes(14.0);
+        g.cleanup(prune_len);
         g.extend_border_edges(grid);
         g
     }
@@ -128,6 +131,67 @@ impl RoadGraph {
             self.nodes[n].border = true;
             self.nodes[n].radius = 0.0;
         }
+    }
+
+    /// 距離 `d` 未満の短いエッジで結ばれた節点同士を 1 つにまとめる（位置は平均）。
+    /// 自己ループになったエッジは残し、後続の `cleanup` が消す。
+    fn merge_close_nodes(&mut self, d: f32) {
+        loop {
+            let Some(ei) = (0..self.edges.len()).find(|&ei| {
+                let e = &self.edges[ei];
+                e.a != e.b
+                    && e.len() < d
+                    && self.nodes[e.a].edges.len() >= 2
+                    && self.nodes[e.b].edges.len() >= 2
+            }) else {
+                break;
+            };
+            let (a, b) = (self.edges[ei].a, self.edges[ei].b);
+            let (wa, wb) = (
+                self.nodes[a].edges.len() as f32,
+                self.nodes[b].edges.len() as f32,
+            );
+            let pos = (self.nodes[a].pos * wa + self.nodes[b].pos * wb) / (wa + wb);
+            let radius = self.nodes[a].radius.max(self.nodes[b].radius);
+            // b を a に併合
+            let b_edges = std::mem::take(&mut self.nodes[b].edges);
+            for &e in &b_edges {
+                let edge = &mut self.edges[e];
+                if edge.a == b {
+                    edge.a = a;
+                }
+                if edge.b == b {
+                    edge.b = a;
+                }
+                if e != ei && !self.nodes[a].edges.contains(&e) {
+                    self.nodes[a].edges.push(e);
+                }
+            }
+            self.nodes[a].edges.retain(|&e| e != ei);
+            self.edges[ei] = Edge::new(a, a, vec![pos, pos]);
+            self.nodes[a].pos = pos;
+            self.nodes[a].radius = radius;
+            // a につながる全エッジの端点を新しい位置へ
+            for &e in &self.nodes[a].edges.clone() {
+                let edge = &self.edges[e];
+                let mut pts = edge.pts.clone();
+                if edge.a == a {
+                    pts[0] = pos;
+                }
+                if edge.b == a {
+                    let n = pts.len();
+                    pts[n - 1] = pos;
+                }
+                let (ea, eb) = (edge.a, edge.b);
+                self.edges[e] = Edge::new(ea, eb, pts);
+            }
+        }
+    }
+
+    /// 行き止まり（範囲の縁ではない次数 1 の節点）か。
+    pub fn is_dead_end(&self, n: usize) -> bool {
+        let nd = &self.nodes[n];
+        nd.edges.len() == 1 && !nd.border
     }
 
     /// ヒゲの除去と次数 2 ノードの連結を、変化がなくなるまで繰り返す。

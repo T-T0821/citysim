@@ -6,6 +6,8 @@
 //! - 建物 (`bldg:Building`) のフットプリント（LOD0 または LOD1 の底面）
 //! - 道路 (`tran:Road`) の LOD1 面（歩行可能領域の候補）
 
+pub mod obj;
+
 use anyhow::{Context, Result};
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -37,6 +39,9 @@ pub struct Feature {
     pub rings: Vec<Ring>,
     /// 建物の計測高さ (`bldg:measuredHeight`)。
     pub height: Option<f64>,
+    /// 建物の立体（描画用）。三角形の頂点、高さは底面からの相対値 [m]。
+    /// CityGML からは作らない（押し出しで描く）。OBJ 読込時のみ入る。
+    pub solid: Vec<[GeoPoint; 3]>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -55,6 +60,16 @@ impl CityModel {
     }
     pub fn merge(&mut self, other: CityModel) {
         self.features.extend(other.features);
+    }
+    /// 指定した緯度経度の範囲（min_lat, min_lon, max_lat, max_lon）に一部でもかかる地物だけ残す。
+    pub fn crop(&mut self, b: (f64, f64, f64, f64)) {
+        self.features.retain(|f| {
+            f.rings
+                .iter()
+                .flatten()
+                .any(|p| p.lat >= b.0 && p.lat <= b.2 && p.lon >= b.1 && p.lon <= b.3)
+                || ring_bbox_intersects(f, b)
+        });
     }
     /// 全頂点の緯度経度の範囲 (min_lat, min_lon, max_lat, max_lon)。
     pub fn bounds(&self) -> Option<(f64, f64, f64, f64)> {
@@ -214,7 +229,22 @@ fn finish(p: Pending) -> Option<Feature> {
         gml_id: p.gml_id,
         rings,
         height: p.height,
+        solid: vec![],
     })
+}
+
+/// 地物のバウンディングボックスが範囲と交差するか（大きな道路面が範囲をまたぐ場合用）。
+fn ring_bbox_intersects(f: &Feature, b: (f64, f64, f64, f64)) -> bool {
+    let mut it = f.rings.iter().flatten();
+    let Some(p) = it.next() else { return false };
+    let mut fb = (p.lat, p.lon, p.lat, p.lon);
+    for p in it {
+        fb.0 = fb.0.min(p.lat);
+        fb.1 = fb.1.min(p.lon);
+        fb.2 = fb.2.max(p.lat);
+        fb.3 = fb.3.max(p.lon);
+    }
+    fb.0 <= b.2 && fb.2 >= b.0 && fb.1 <= b.3 && fb.3 >= b.1
 }
 
 fn mean_h(r: &Ring) -> f64 {

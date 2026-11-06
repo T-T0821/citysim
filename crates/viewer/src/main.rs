@@ -19,6 +19,9 @@ const DT: f32 = 0.05;
 
 struct Args {
     gml: Vec<PathBuf>,
+    obj: Vec<PathBuf>,
+    obj_origin: Option<(f64, f64)>,
+    crop: Option<(f64, f64, f64)>,
     agents: usize,
     vehicles: usize,
     cell: f32,
@@ -35,6 +38,9 @@ struct Args {
 fn parse_args() -> Result<Args> {
     let mut a = Args {
         gml: vec![],
+        obj: vec![],
+        obj_origin: None,
+        crop: None,
         agents: 1000,
         vehicles: 40,
         record: None,
@@ -64,6 +70,34 @@ fn parse_args() -> Result<Args> {
                     a.gml.push(p);
                 }
             }
+            // PLATEAU SDK for Unity などが書き出した OBJ（bldg_* / tran_* グループ付き）
+            "--obj" => {
+                let p = PathBuf::from(v()?);
+                if p.is_dir() {
+                    for e in std::fs::read_dir(&p)? {
+                        let e = e?.path();
+                        if e.extension().is_some_and(|x| x == "obj") {
+                            a.obj.push(e);
+                        }
+                    }
+                } else {
+                    a.obj.push(p);
+                }
+            }
+            // OBJ の原点の緯度,経度
+            "--obj-origin" => a.obj_origin = Some(parse_pair(&v()?)?),
+            // 切り出し範囲: 中心の緯度,経度,半径[m]
+            "--crop" => {
+                let s = v()?;
+                let x: Vec<f64> = s
+                    .split(',')
+                    .map(|t| t.trim().parse())
+                    .collect::<std::result::Result<_, _>>()?;
+                if x.len() != 3 {
+                    bail!("--crop は 緯度,経度,半径m");
+                }
+                a.crop = Some((x[0], x[1], x[2]));
+            }
             "--agents" => a.agents = v()?.parse()?,
             "--vehicles" => a.vehicles = v()?.parse()?,
             "--cell" => a.cell = v()?.parse()?,
@@ -89,7 +123,7 @@ fn parse_args() -> Result<Args> {
             "--warmup" => a.warmup = v()?.parse()?,
             "-h" | "--help" => {
                 println!(
-                    "usage: plateau-crowd-viewer --gml <file|dir>... [--agents N] [--vehicles N] [--cell M] [--seed N]\n\
+                    "usage: plateau-crowd-viewer (--gml <file|dir> | --obj <file|dir> --obj-origin 緯度,経度)... [--crop 緯度,経度,半径m] [--agents N] [--vehicles N] [--cell M] [--seed N]\n\
                      \x20                          [--no-respawn] [--screenshot out.png <sim秒>]\n\
                      \x20                          [--record <dir> <動画の秒数>] [--fps 30] [--speed 2] [--orbit rad/s] [--warmup 秒]"
                 );
@@ -98,10 +132,47 @@ fn parse_args() -> Result<Args> {
             _ => bail!("不明な引数: {k}"),
         }
     }
-    if a.gml.is_empty() {
-        bail!("--gml を 1 つ以上指定してください (--help)");
+    if a.gml.is_empty() && a.obj.is_empty() {
+        bail!("--gml か --obj を 1 つ以上指定してください (--help)");
+    }
+    if !a.obj.is_empty() && a.obj_origin.is_none() {
+        bail!("--obj には --obj-origin 緯度,経度 が必要です");
     }
     Ok(a)
+}
+
+fn parse_pair(s: &str) -> Result<(f64, f64)> {
+    let x: Vec<f64> = s
+        .split(',')
+        .map(|t| t.trim().parse())
+        .collect::<std::result::Result<_, _>>()?;
+    if x.len() != 2 {
+        bail!("緯度,経度 の形式で指定してください: {s}");
+    }
+    Ok((x[0], x[1]))
+}
+
+/// 入力ファイルを読み、必要なら範囲を切り出す。戻り値はモデルとグリッド化する範囲。
+fn load_model(args: &Args) -> Result<(plateau_gml::CityModel, Option<(f64, f64, f64, f64)>)> {
+    let mut model = plateau_gml::CityModel::default();
+    for p in &args.gml {
+        model.merge(plateau_gml::parse_file(p)?);
+    }
+    if let Some((lat0, lon0)) = args.obj_origin {
+        let frame = plateau_gml::obj::ObjFrame::unity_export(lat0, lon0);
+        for p in &args.obj {
+            model.merge(plateau_gml::obj::parse_file(p, frame)?);
+        }
+    }
+    let bounds = args.crop.map(|(lat, lon, r)| {
+        let dlat = r / 111_320.0;
+        let dlon = r / (111_320.0 * lat.to_radians().cos());
+        (lat - dlat, lon - dlon, lat + dlat, lon + dlon)
+    });
+    if let Some(b) = bounds {
+        model.crop(b);
+    }
+    Ok((model, bounds))
 }
 
 #[derive(Resource)]
@@ -160,16 +231,14 @@ struct Hud;
 
 fn main() -> Result<()> {
     let args = parse_args()?;
-    let mut model = plateau_gml::CityModel::default();
-    for p in &args.gml {
-        model.merge(plateau_gml::parse_file(p)?);
-    }
+    let (model, bounds) = load_model(&args)?;
     info!(
         "建物 {} 棟, 道路 {} 件",
         model.buildings().count(),
         model.roads().count()
     );
-    let grid = WalkGrid::from_city(&model, args.cell).context("座標を含む地物がありません")?;
+    let grid = WalkGrid::from_city_bounds(&model, args.cell, bounds)
+        .context("座標を含む地物がありません")?;
     let traffic = (args.vehicles > 0 && grid.has_roads).then(|| {
         let net = RoadGraph::from_grid(&grid, crowd::scenario::SIDEWALK_W);
         info!(
@@ -412,15 +481,21 @@ fn setup(
 
     // 建物（高さで色を少し変える）
     let mut by_band: [MeshBuilder; 3] = Default::default();
-    for (poly, h) in &g.buildings {
-        let band = if *h < 15.0 {
+    for b in &g.buildings {
+        let band = if b.height < 15.0 {
             0
-        } else if *h < 40.0 {
+        } else if b.height < 40.0 {
             1
         } else {
             2
         };
-        by_band[band].add_extrusion(poly, h.max(3.0));
+        if b.solid.is_empty() {
+            for poly in &b.footprint {
+                by_band[band].add_extrusion(poly, b.height.max(3.0));
+            }
+        } else {
+            by_band[band].add_solid(&b.solid);
+        }
     }
     let colors = [
         Color::srgb(0.93, 0.91, 0.86),

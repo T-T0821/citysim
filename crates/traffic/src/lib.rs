@@ -26,6 +26,8 @@ pub struct Params {
     pub lock_hold: f32,
     /// 歩行者に阻まれてこの秒数止まったら徐行で進む
     pub creep_after: f32,
+    /// 交差点でこの秒数待たされたら通行権を待たずに進む
+    pub deadlock_after: f32,
 }
 
 impl Default for Params {
@@ -39,6 +41,7 @@ impl Default for Params {
             v_turn: 4.5,
             lock_hold: 6.0,
             creep_after: 5.0,
+            deadlock_after: 15.0,
         }
     }
 }
@@ -68,6 +71,7 @@ pub struct Vehicle {
     pub heading: Vec2,
     lat_err: Vec2,
     ped_wait: f32,
+    junction_wait: f32,
     pub style: u32,
 }
 
@@ -192,6 +196,7 @@ impl Traffic {
             heading: Vec2::X,
             lat_err: Vec2::ZERO,
             ped_wait: 0.0,
+            junction_wait: 0.0,
             style,
         };
         v.next = self.choose_next(lane);
@@ -258,6 +263,14 @@ impl Traffic {
                 fwd: self.graph.edges[e].a == n,
             })
             .collect();
+        // 行き止まりへ入る道は、ほかに選べる道があれば避ける
+        let into_dead_end = |g: &RoadGraph, l: &Lane| {
+            let e = &g.edges[l.edge];
+            g.is_dead_end(if l.fwd { e.b } else { e.a })
+        };
+        if cands.iter().any(|c| !into_dead_end(&self.graph, c)) {
+            cands.retain(|c| !into_dead_end(&self.graph, c));
+        }
         if cands.is_empty() {
             // 行き止まり: U ターン
             cands.push(Lane {
@@ -342,9 +355,12 @@ impl Traffic {
                             j == i
                                 || u.s - 0.5 * u.length > self.start_radius(next) + v.length + 1.0
                         });
-                    let free = exit_room && self.can_enter(end, mv);
+                    // 長く待たされたら（デッドロック回避）強引に入る
+                    let stuck = v.junction_wait > p.deadlock_after;
+                    let free = stuck || (exit_room && self.can_enter(end, mv));
                     let wants = stop < 6.0 + v.v * v.v / (2.0 * p.b_comf);
                     if free && wants {
+                        self.vehicles[i].junction_wait = 0.0;
                         let now = self.time;
                         let lk = &mut self.locks[end];
                         match lk.active.iter_mut().find(|(m, _, _)| *m == mv) {
@@ -357,6 +373,9 @@ impl Traffic {
                         if stop.max(0.0) < gap {
                             gap = stop.max(0.0);
                             v_lead = 0.0;
+                        }
+                        if v.v < 0.3 && stop < 8.0 {
+                            self.vehicles[i].junction_wait += dt;
                         }
                     }
                 }

@@ -39,6 +39,34 @@ cargo run --release -- --gml udx/bldg/53394611_bldg_6697_op.gml \
     --gml udx/tran/53394611_tran_6697_op.gml --agents 2000
 ```
 
+## 実際の PLATEAU データで動かす
+
+### CityGML（公式配布データ）
+
+[G空間情報センター](https://www.geospatial.jp/ckan/dataset/plateau) から都市の CityGML を取得し、
+`udx/bldg/` と `udx/tran/` の 3 次メッシュ単位のファイルを渡します。`--crop 緯度,経度,半径m` で範囲を切り出せます。
+
+```sh
+cargo run --release -- --gml udx/bldg/53393596_bldg_6697_op.gml --gml udx/tran/53393596_tran_6697_op.gml \
+    --crop 35.65949,139.70055,220 --agents 1500 --vehicles 30 --map-png map.png
+```
+
+### OBJ（PLATEAU SDK for Unity などの書き出し）
+
+`g bldg_…` / `g tran_…` のグループ名が付いた OBJ も読めます（PLATEAU SDK for Unity の書き出し形式）。
+局所座標なので原点の緯度経度を `--obj-origin` で指定します。SDK の書き出しは x が西向き・z が北向き・y が上向きで、
+原点は取り込み範囲の基準点（複数メッシュなら中心）です。建物は LOD1/LOD2 の立体をそのまま描き、道路は LOD1〜3 を重ねて使います。
+
+```sh
+# 渋谷スクランブル交差点周辺 440m 四方（4 メッシュ 533935-85/86/95/96、原点はその接点）
+cargo run --release -p plateau-crowd-viewer -- --obj data/shibuya --obj-origin 35.6583333333,139.7 \
+    --crop 35.65949,139.70055,220 --agents 1500 --vehicles 30
+```
+
+![shibuya](docs/shibuya-scramble.png)
+
+出典: 国土交通省 Project PLATEAU 3D 都市モデル（渋谷区）を加工して作成（[PLATEAU サイトポリシー](https://www.mlit.go.jp/plateau/site-policy/)、CC BY 4.0 互換）。
+
 ## 3D ビューア
 
 ```sh
@@ -53,7 +81,7 @@ cargo run --release -p plateau-crowd-viewer -- --gml testdata/sample.gml --agent
 | H | 通行量ヒートマップの表示切替 |
 
 歩行者は目的地（東西南北の縁）ごとに色分けされ、車は乗用車（4.5m）とトラック（7.5m、1 割）が走ります。歩行者は到着すると別の縁から再投入されます（`--no-respawn` で無効）。
-`--screenshot out.png 60` でシミュレーション 60 秒時点の画面を保存して終了します（`PLATEAU_SHOW_HEAT=1` でヒートマップ付き、`PLATEAU_CAM="yaw,pitch,距離,x,y"` でカメラ位置指定）。
+`--map-png` で歩行空間・車道・抽出した道路網を描いた確認用の地図を出力します。`--screenshot out.png 60` でシミュレーション 60 秒時点の画面を保存して終了します（`PLATEAU_SHOW_HEAT=1` でヒートマップ付き、`PLATEAU_CAM="yaw,pitch,距離,x,y"` でカメラ位置指定）。
 
 動画は `--record <出力ディレクトリ> <秒数>` で連番 PNG を書き出し、ffmpeg でつなぎます（`--speed` 再生倍率、`--orbit` カメラ旋回 rad/s、`--warmup` 録画前に進める秒数）。
 
@@ -72,7 +100,8 @@ Linux では `libxkbcommon-x11-0` と Vulkan ドライバ（GPU のもの、ま�
 ## ロードマップ
 
 - [x] MVP: CityGML 読込 → グリッド → フローフィールド → Social Force → CSV/PNG
-- [ ] 実データ検証（PLATEAU の bldg + tran を 1 メッシュ分）、大きなファイルの高速化
+- [x] 実データ検証（渋谷 4 メッシュの OBJ、CityGML 抜粋）
+- [ ] CityGML LOD2/LOD3 の `tran:TrafficArea`（車道部・歩道部）を使った正確な歩道判定、横断歩道の位置
 - [ ] シナリオ定義（TOML）: 出発地・目的地（駅出口など）・発生レート・時間帯
 - [x] 可視化: bevy で 3D 建物 + エージェントのリアルタイム表示
 - [ ] 可視化の拡張: LOD2 の屋根形状・テクスチャ、地形 (dem)、wasm + WebGPU でブラウザ表示

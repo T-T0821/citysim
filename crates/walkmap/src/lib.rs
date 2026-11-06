@@ -42,6 +42,16 @@ impl LocalProjection {
 
 pub type Polygon = Vec<Vec2>;
 
+/// 描画用の建物形状（局所座標 [m]）。
+#[derive(Debug, Clone)]
+pub struct Building {
+    /// 底面ポリゴン群（CityGML なら 1 つ、OBJ なら三角形群）
+    pub footprint: Vec<Polygon>,
+    pub height: f32,
+    /// 立体の三角形（x=東, y=北, z=高さ）。空なら底面を押し出して描く。
+    pub solid: Vec<[glam::Vec3; 3]>,
+}
+
 /// セル単位の歩行可能グリッド。
 #[derive(Debug, Clone)]
 pub struct WalkGrid {
@@ -53,7 +63,7 @@ pub struct WalkGrid {
     /// 各セル中心から最寄りの非歩行セルまでの距離 [m]
     pub obstacle_dist: Vec<f32>,
     pub projection: LocalProjection,
-    pub buildings: Vec<(Polygon, f32)>,
+    pub buildings: Vec<Building>,
     /// 道路面データから歩行空間を作ったか
     pub has_roads: bool,
     /// 車道セル（`mark_carriageway` で設定。未設定なら空）
@@ -64,7 +74,16 @@ pub struct WalkGrid {
 
 impl WalkGrid {
     pub fn from_city(model: &CityModel, cell: f32) -> Option<Self> {
-        let (min_lat, min_lon, max_lat, max_lon) = model.bounds()?;
+        Self::from_city_bounds(model, cell, None)
+    }
+
+    /// `bounds` = (min_lat, min_lon, max_lat, max_lon) を与えるとその範囲だけをグリッド化する。
+    pub fn from_city_bounds(
+        model: &CityModel,
+        cell: f32,
+        bounds: Option<(f64, f64, f64, f64)>,
+    ) -> Option<Self> {
+        let (min_lat, min_lon, max_lat, max_lon) = bounds.or_else(|| model.bounds())?;
         let proj = LocalProjection::new(min_lat, min_lon);
         let max = proj.to_local(&GeoPoint {
             lat: max_lat,
@@ -80,17 +99,33 @@ impl WalkGrid {
             .roads()
             .flat_map(|f| f.rings.iter().map(to_poly))
             .collect();
-        let buildings: Vec<(Polygon, f32)> = model
+        let buildings: Vec<Building> = model
             .buildings()
-            .map(|f| (to_poly(&f.rings[0]), f.height.unwrap_or(10.0) as f32))
+            .map(|f| Building {
+                footprint: f.rings.iter().map(to_poly).collect(),
+                height: f.height.unwrap_or(10.0) as f32,
+                solid: f
+                    .solid
+                    .iter()
+                    .map(|t| {
+                        let v = |p: &GeoPoint| {
+                            let q = proj.to_local(p);
+                            glam::Vec3::new(q.x, q.y, p.h as f32)
+                        };
+                        [v(&t[0]), v(&t[1]), v(&t[2])]
+                    })
+                    .collect(),
+            })
             .collect();
 
         let mut walkable = vec![roads.is_empty(); w * h];
         for p in &roads {
             fill_polygon(p, Vec2::ZERO, cell, w, h, |i| walkable[i] = true);
         }
-        for (p, _) in &buildings {
-            fill_polygon(p, Vec2::ZERO, cell, w, h, |i| walkable[i] = false);
+        for b in &buildings {
+            for p in &b.footprint {
+                fill_polygon(p, Vec2::ZERO, cell, w, h, |i| walkable[i] = false);
+            }
         }
         let mut g = Self {
             origin: Vec2::ZERO,

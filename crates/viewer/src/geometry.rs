@@ -49,6 +49,35 @@ impl MeshBuilder {
         .with_inserted_indices(Indices::U32(self.idx))
     }
 
+    /// 立体の三角形（x=東, y=北, z=高さ）をそのまま追加。法線は重心から外向きにそろえる。
+    pub fn add_solid(&mut self, tris: &[[Vec3; 3]]) {
+        if tris.is_empty() {
+            return;
+        }
+        let c = tris.iter().flatten().sum::<Vec3>() / (tris.len() * 3) as f32;
+        for t in tris {
+            let w = [
+                to_world(t[0].xy(), t[0].z),
+                to_world(t[1].xy(), t[1].z),
+                to_world(t[2].xy(), t[2].z),
+            ];
+            let mut n = (w[1] - w[0]).cross(w[2] - w[0]);
+            if n.length_squared() < 1e-12 {
+                continue;
+            }
+            n = n.normalize();
+            let cw = to_world(c.xy(), c.z);
+            let (a, b, d) = if n.dot((w[0] + w[1] + w[2]) / 3.0 - cw) < 0.0 {
+                n = -n;
+                (w[0], w[2], w[1])
+            } else {
+                (w[0], w[1], w[2])
+            };
+            let i = [self.vert(a, n), self.vert(b, n), self.vert(d, n)];
+            self.idx.extend_from_slice(&i);
+        }
+    }
+
     /// フットプリントを高さ `h` まで押し出す（壁 + 屋根）。
     pub fn add_extrusion(&mut self, footprint: &[Vec2], h: f32) {
         let mut poly: Vec<Vec2> = footprint.to_vec();
