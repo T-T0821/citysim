@@ -1,0 +1,10 @@
+[package]
+name = "plateau-fetch"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ureq = { version = "2.10", features = ["proxy-from-env"] }
+serde_json = "1"

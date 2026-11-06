@@ -5,6 +5,7 @@
 //! - 交差点: 進入方向ごとの排他ロック（同じ方向からの車列はまとめて通す、一定時間で交代）
 //! - 信号機（任意, [`signal`]）: 赤・黄では停止線で止まり、青の間だけ上の通行権で交差点に入る
 //! - 出入口: 範囲の縁の端点から流入し、縁に着いたら別の出入口から再投入
+//! - 車種: 乗用車・トラック・バス（停留所で停車）・自転車（車道の左端、車とは別の列）
 
 mod closure;
 pub mod graph;
@@ -34,7 +35,98 @@ pub struct Params {
     pub deadlock_after: f32,
     /// 希望速度の上限 [m/s]（各車はこの 70〜100%）
     pub speed_limit: f32,
+    /// 車種の構成比（残りは乗用車）
+    pub mix: VehicleMix,
 }
+
+/// 車種。大きさ・速度・走行位置が違う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VehicleKind {
+    Car,
+    Truck,
+    /// 路線バス: 長さ 11m、制限速度の 85% まで、停留所（一定間隔）で停車する
+    Bus,
+    /// 自転車: 車道の左端を 12〜20km/h で走る。車は自転車を追い越せる（同じ列には並ばない）
+    Bicycle,
+}
+
+impl VehicleKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            VehicleKind::Car => "car",
+            VehicleKind::Truck => "truck",
+            VehicleKind::Bus => "bus",
+            VehicleKind::Bicycle => "bicycle",
+        }
+    }
+    pub fn label_ja(self) -> &'static str {
+        match self {
+            VehicleKind::Car => "乗用車",
+            VehicleKind::Truck => "トラック",
+            VehicleKind::Bus => "バス",
+            VehicleKind::Bicycle => "自転車",
+        }
+    }
+    /// (長さ, 幅) [m]
+    pub fn size(self) -> (f32, f32) {
+        match self {
+            VehicleKind::Car => (4.5, 1.8),
+            VehicleKind::Truck => (7.5, 2.3),
+            VehicleKind::Bus => (11.0, 2.5),
+            VehicleKind::Bicycle => (1.8, 0.6),
+        }
+    }
+    pub fn is_bicycle(self) -> bool {
+        self == VehicleKind::Bicycle
+    }
+}
+
+/// 車種の構成比（0〜1）。合計が 1 を超えた分は後ろの種別から削る。
+#[derive(Debug, Clone, Copy)]
+pub struct VehicleMix {
+    pub truck: f32,
+    pub bus: f32,
+    pub bicycle: f32,
+}
+
+impl Default for VehicleMix {
+    fn default() -> Self {
+        Self {
+            truck: 0.1,
+            bus: 0.05,
+            bicycle: 0.15,
+        }
+    }
+}
+
+impl VehicleMix {
+    /// 乗用車だけ（従来の挙動に近い構成）
+    pub const CARS_ONLY: Self = Self {
+        truck: 0.0,
+        bus: 0.0,
+        bicycle: 0.0,
+    };
+    fn pick(&self, u: f32) -> VehicleKind {
+        let mut acc = 0.0;
+        for (p, k) in [
+            (self.truck, VehicleKind::Truck),
+            (self.bus, VehicleKind::Bus),
+            (self.bicycle, VehicleKind::Bicycle),
+        ] {
+            acc += p.max(0.0);
+            if u < acc {
+                return k;
+            }
+        }
+        VehicleKind::Car
+    }
+}
+
+/// バスの停留所間隔 [m] と停車時間 [s]
+const BUS_STOP_SPACING: f32 = 220.0;
+const BUS_DWELL: f32 = 15.0;
+/// 自転車が車のレーン中心からさらに左へ寄る量 [m]
+const BICYCLE_EXTRA_OFFSET: f32 = 1.2;
 
 impl Default for Params {
     fn default() -> Self {
@@ -49,6 +141,7 @@ impl Default for Params {
             creep_after: 5.0,
             deadlock_after: 15.0,
             speed_limit: 13.0,
+            mix: VehicleMix::default(),
         }
     }
 }
@@ -80,6 +173,14 @@ pub struct Vehicle {
     ped_wait: f32,
     junction_wait: f32,
     pub style: u32,
+    pub kind: VehicleKind,
+    /// 中心線から左へのずれ [m]（自転車は車道の左端寄り）
+    pub offset: f32,
+    /// バス: 前の停留所からの走行距離 [m] と停車の残り時間 [s]
+    since_stop: f32,
+    pub dwell: f32,
+    /// バス: 次に停まる位置（現在のレーン上の s）
+    stop_s: Option<f32>,
 }
 
 /// 交差点での動線（進入レーン → 退出レーン）。
@@ -107,6 +208,8 @@ pub struct Traffic {
     locks: Vec<JunctionLock>,
     rng: u64,
     entries: Vec<Lane>,
+    /// 停止命令（災害避難など）: 全車が減速して止まり、再投入もしない
+    pub halted: bool,
     /// 信号機（None なら先着順の通行権だけで制御）
     pub signals: Option<Signals>,
 }
@@ -139,6 +242,7 @@ impl Traffic {
             locks,
             rng: seed.max(1),
             entries,
+            halted: false,
             signals: None,
         };
         // 初期配置: 道路網全体に間隔をあけてばらまく
@@ -199,15 +303,30 @@ impl Traffic {
 
     fn make_vehicle(&mut self, lane: Lane, s: f32) -> Vehicle {
         let style = self.rand(1 << 16) as u32;
-        let truck = style % 10 == 0;
-        let v0 = self.params.speed_limit * (0.7 + 0.3 * self.randf());
+        let u = self.randf();
+        let kind = self.params.mix.pick(u);
+        let (length, width) = kind.size();
+        let r = self.randf();
+        let v0 = match kind {
+            // 12〜20 km/h（制限速度が低ければそれに従う）
+            VehicleKind::Bicycle => (3.3 + 2.2 * r).min(self.params.speed_limit),
+            VehicleKind::Bus => self.params.speed_limit * (0.75 + 0.1 * r),
+            VehicleKind::Truck => self.params.speed_limit * (0.7 + 0.2 * r),
+            VehicleKind::Car => self.params.speed_limit * (0.7 + 0.3 * r),
+        };
+        let offset = self.params.lane_offset
+            + if kind.is_bicycle() {
+                BICYCLE_EXTRA_OFFSET
+            } else {
+                0.0
+            };
         let mut v = Vehicle {
             lane,
             s,
             v: v0 * 0.6,
             v0,
-            length: if truck { 7.5 } else { 4.5 },
-            width: if truck { 2.3 } else { 1.8 },
+            length,
+            width,
             next: None,
             active: true,
             lock: None,
@@ -217,9 +336,15 @@ impl Traffic {
             ped_wait: 0.0,
             junction_wait: 0.0,
             style,
+            kind,
+            offset,
+            // 停留所の位置がバスごとにずれるように
+            since_stop: BUS_STOP_SPACING * self.randf(),
+            dwell: 0.0,
+            stop_s: None,
         };
         v.next = self.choose_next(lane);
-        let (p, d) = self.lane_pose(lane, s);
+        let (p, d) = self.lane_pose_at(lane, s, offset);
         v.pos = p;
         v.heading = d;
         v
@@ -263,8 +388,12 @@ impl Traffic {
     }
     /// 左側通行のレーン上の位置。
     pub fn lane_pose(&self, l: Lane, s: f32) -> (Vec2, Vec2) {
+        self.lane_pose_at(l, s, self.params.lane_offset)
+    }
+    /// 中心線から左へ `offset` [m] ずらした位置。
+    pub fn lane_pose_at(&self, l: Lane, s: f32, offset: f32) -> (Vec2, Vec2) {
         let (p, d) = self.center_pose(l, s);
-        (p + d.perp() * self.params.lane_offset, d)
+        (p + d.perp() * offset, d)
     }
 
     fn choose_next(&mut self, l: Lane) -> Option<Lane> {
@@ -332,11 +461,19 @@ impl Traffic {
             let len = self.lane_len(v.lane);
             let remaining = len - v.s;
             // 先行車（同じレーン → 次のレーン）
+            // 停止命令: ゆっくり止まる
+            if self.halted {
+                accs[i] = if v.v > 0.0 { -p.b_comf } else { 0.0 };
+                continue;
+            }
+            // 自転車は車道の左端、車はその内側を走るので、同じ列（自転車同士・車同士）だけ追従する
+            let bike = v.kind.is_bicycle();
+            let same_track = |u: &Vehicle| u.kind.is_bicycle() == bike;
             let mut gap = f32::INFINITY;
             let mut v_lead = v.v;
             if let Some(list) = by_lane.get(&v.lane) {
                 let k = list.iter().position(|&j| j == i).unwrap();
-                if let Some(&j) = list.get(k + 1) {
+                if let Some(&j) = list[k + 1..].iter().find(|&&j| same_track(&self.vehicles[j])) {
                     let u = &self.vehicles[j];
                     gap = u.s - v.s - 0.5 * (u.length + v.length);
                     v_lead = u.v;
@@ -344,7 +481,10 @@ impl Traffic {
             }
             if gap.is_infinite() {
                 if let Some(next) = v.next {
-                    if let Some(&j) = by_lane.get(&next).and_then(|l| l.first()) {
+                    if let Some(&j) = by_lane
+                        .get(&next)
+                        .and_then(|l| l.iter().find(|&&j| same_track(&self.vehicles[j])))
+                    {
                         let u = &self.vehicles[j];
                         if j != i {
                             gap = remaining + u.s - 0.5 * (u.length + v.length);
@@ -353,6 +493,41 @@ impl Traffic {
                     }
                 }
             }
+            // バス: 停留所で停車
+            if v.kind == VehicleKind::Bus {
+                if v.dwell > 0.0 {
+                    accs[i] = if v.v > 0.0 { -p.b_comf * 1.5 } else { 0.0 };
+                    self.vehicles[i].dwell = (v.dwell - dt).max(0.0);
+                    continue;
+                }
+                let end_r = self.end_radius(v.lane);
+                match v.stop_s {
+                    Some(stop) => {
+                        // IDM は最小車間 s0 の手前で止まる
+                        if stop - v.s < p.s0 + 1.0 && v.v < 0.5 {
+                            let b = &mut self.vehicles[i];
+                            b.dwell = BUS_DWELL;
+                            b.stop_s = None;
+                            b.since_stop = 0.0;
+                            accs[i] = -p.b_comf;
+                            continue;
+                        }
+                        if stop - v.s < gap {
+                            gap = (stop - v.s).max(0.0);
+                            v_lead = 0.0;
+                        }
+                    }
+                    None if v.since_stop >= BUS_STOP_SPACING => {
+                        // 交差点の手前 8m より前に、無理なく止まれる位置を停留所にする
+                        let stop = v.s + v.v * v.v / (2.0 * p.b_comf) + 2.0;
+                        if stop < len - end_r - 8.0 {
+                            self.vehicles[i].stop_s = Some(stop);
+                        }
+                    }
+                    None => {}
+                }
+            }
+            let v = &self.vehicles[i];
             // 交差点: ロックが取れなければ停止線で止まる
             let end = self.end_node(v.lane);
             let node = &self.graph.nodes[end];
@@ -387,7 +562,7 @@ impl Traffic {
                     // 出口側のレーンに入る余地がなければ交差点に入らない（交差点内で止まらない）
                     let exit_room = by_lane
                         .get(&next)
-                        .and_then(|l| l.first())
+                        .and_then(|l| l.iter().find(|&&j| same_track(&self.vehicles[j])))
                         .map_or(true, |&j| {
                             let u = &self.vehicles[j];
                             j == i
@@ -465,6 +640,12 @@ impl Traffic {
             let veh = &mut self.vehicles[i];
             veh.v = (veh.v + a * dt).max(0.0);
             veh.s += veh.v * dt;
+            if self.halted {
+                // 停止命令: 左端に寄せて止める（歩行者が車道の中央を通れるように）
+                let edge = self.params.lane_offset + BICYCLE_EXTRA_OFFSET;
+                veh.offset = (veh.offset + 0.6 * dt).min(edge.max(veh.offset));
+            }
+            veh.since_stop += veh.v * dt;
             let mut lane = veh.lane;
             let mut s = veh.s;
             let mut transitioned = false;
@@ -474,6 +655,7 @@ impl Traffic {
                     Some(n) => {
                         lane = n;
                         transitioned = true;
+                        self.vehicles[i].stop_s = None;
                         let nn = self.choose_next(n);
                         self.vehicles[i].next = nn;
                     }
@@ -494,7 +676,7 @@ impl Traffic {
                     self.release(i);
                 }
             }
-            let (target, dir) = self.lane_pose(lane, s);
+            let (target, dir) = self.lane_pose_at(lane, s, self.vehicles[i].offset);
             let veh = &mut self.vehicles[i];
             if transitioned {
                 // 曲がり角でのレーン中心の飛びを、横ずれとして滑らかに解消
@@ -577,7 +759,7 @@ impl Traffic {
 
     /// 縁に出た車を、空いている出入口から再投入する。
     fn respawn(&mut self) {
-        if self.entries.is_empty() {
+        if self.entries.is_empty() || self.halted {
             return;
         }
         for i in 0..self.vehicles.len() {
@@ -596,6 +778,18 @@ impl Traffic {
             let style = self.vehicles[i].style;
             let mut v = self.make_vehicle(lane, 0.0);
             v.style = style;
+            // 種別は入れ替えない（構成比を保つ）
+            let kind = self.vehicles[i].kind;
+            if v.kind != kind {
+                v.kind = kind;
+                (v.length, v.width) = kind.size();
+                v.offset = self.vehicles[i].offset;
+                v.v0 = self.vehicles[i].v0;
+                v.v = v.v0 * 0.6;
+                let (p, d) = self.lane_pose_at(lane, 0.0, v.offset);
+                v.pos = p;
+                v.heading = d;
+            }
             self.vehicles[i] = v;
         }
     }
@@ -722,7 +916,11 @@ mod tests {
             // 同じレーン上で車が重ならない
             for a in t.vehicles.iter().filter(|v| v.active) {
                 for b in t.vehicles.iter().filter(|v| v.active) {
-                    if !std::ptr::eq(a, b) && a.lane == b.lane {
+                    // 自転車は車道の左端を走り、車に追い越されるので同じ列どうしだけ調べる
+                    if !std::ptr::eq(a, b)
+                        && a.lane == b.lane
+                        && a.kind.is_bicycle() == b.kind.is_bicycle()
+                    {
                         assert!(
                             (a.s - b.s).abs() > 0.5 * (a.length + b.length) - 0.5,
                             "overlap at t={}",
@@ -735,6 +933,62 @@ mod tests {
         // 平均 3 m/s 以上で流れている（渋滞で詰まっていない）
         let avg = moved / (30.0 * 180.0);
         assert!(avg > 3.0, "avg speed {avg}");
+    }
+
+    #[test]
+    fn mixes_buses_and_bicycles() {
+        let g = grid();
+        let net = RoadGraph::from_grid(&g, 3.0);
+        let params = Params {
+            mix: VehicleMix {
+                truck: 0.0,
+                bus: 0.3,
+                bicycle: 0.3,
+            },
+            ..Default::default()
+        };
+        let mut t = Traffic::new_with(net, 40, 3, params);
+        let count = |t: &Traffic, k| t.vehicles.iter().filter(|v| v.kind == k).count();
+        assert!(count(&t, VehicleKind::Bus) >= 4);
+        assert!(count(&t, VehicleKind::Bicycle) >= 4);
+        for v in &t.vehicles {
+            assert_eq!((v.length, v.width), v.kind.size());
+            if v.kind.is_bicycle() {
+                assert!(v.v0 <= 5.6, "自転車は 20km/h 以下");
+                assert!(v.offset > t.params.lane_offset, "自転車は左端寄り");
+            }
+        }
+        let mut dwelled = false;
+        let mut bike_speed = (0.0, 0);
+        for _ in 0..(120.0 / 0.05) as usize {
+            t.step(0.05, &[]);
+            dwelled |= t
+                .vehicles
+                .iter()
+                .any(|v| v.active && v.kind == VehicleKind::Bus && v.dwell > 0.0 && v.v < 0.1);
+            for v in t.vehicles.iter().filter(|v| v.active && v.kind.is_bicycle()) {
+                bike_speed.0 += v.v;
+                bike_speed.1 += 1;
+            }
+        }
+        assert!(dwelled, "バスが停留所で停車する");
+        let avg = bike_speed.0 / bike_speed.1 as f32;
+        assert!(avg > 1.5 && avg < 5.6, "自転車の平均速度 {avg}");
+    }
+
+    #[test]
+    fn halt_stops_all_vehicles() {
+        let g = grid();
+        let net = RoadGraph::from_grid(&g, 3.0);
+        let mut t = Traffic::new(net, 30, 4);
+        for _ in 0..200 {
+            t.step(0.05, &[]);
+        }
+        t.halted = true;
+        for _ in 0..(15.0 / 0.05) as usize {
+            t.step(0.05, &[]);
+        }
+        assert!(t.vehicles.iter().filter(|v| v.active).all(|v| v.v == 0.0));
     }
 
     #[test]

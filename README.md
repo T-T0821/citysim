@@ -8,8 +8,9 @@ Project PLATEAU（国交省 3D 都市モデル, CityGML）上で歩行者の流�
 crates/
   plateau-gml/  CityGML (bldg / tran) のストリーミングパーサ（quick-xml）
   walkmap/      緯度経度→局所平面、歩行可能グリッド、フローフィールド、障害物距離場
-  crowd/        Social Force Model による歩行者の計算
-  traffic/      車道の中心線ネットワーク抽出と車両の計算（IDM・左側通行・交差点制御）
+  crowd/        Social Force Model による歩行者の計算、災害避難モード
+  traffic/      車道の中心線ネットワーク抽出と車両の計算（IDM・左側通行・交差点制御・車種）
+  fetch/        場所（住所 or 緯度経度）から PLATEAU の CityGML を探して取得（国土地理院ジオコーダ + PLATEAU 配信 API）
   cli/          ヘッドレス実行。軌跡 CSV と通行量ヒートマップ PNG、区画別の集計 CSV・画像を出力
   viewer/       bevy 0.16 による 3D ビューア（建物の押し出し表示 + 歩行者 + ヒートマップ）
 scenarios/      イベント・混雑シナリオと通行止めの設定例（TOML）
@@ -47,6 +48,29 @@ cargo run --release -- --gml udx/bldg/53394611_bldg_6697_op.gml \
 ```
 
 ## 実際の PLATEAU データで動かす
+
+### 場所を指定して自動で取得する
+
+`--place` に住所か「緯度,経度」を渡すと、範囲（`--radius`、既定 220m）にかかる 3 次メッシュの CityGML（建物・道路）を
+`--data-dir`（既定 `data/plateau`）に用意して、その範囲を切り出して動かします。
+
+```sh
+cargo run --release -p plateau-crowd-viewer -- --place "東京都中央区銀座4丁目" --radius 220
+cargo run --release -- --place 35.65949,139.70055 --radius 200 --agents 1500 --png shibuya-heat.png
+```
+
+1. 住所は国土地理院の住所検索 API（`msearch.gsi.go.jp`）で緯度経度にする
+2. 中心と半径から 3 次メッシュ（約 1km 四方）のコードを求める
+3. `--data-dir` 以下（4 階層まで）に `<メッシュ>_bldg_*.gml` / `<メッシュ>_tran_*.gml` があればそれを使う（オフラインでも動く。同梱の銀座なら `--data-dir testdata`）
+4. 無ければ PLATEAU の CityGML 配信 API（`api.plateau.reearth.io/datacatalog/citygml/m:<メッシュ>`）でメッシュ単位の GML を探してダウンロードする。
+   区境のメッシュは区ごとのファイルを両方取り、同じ自治体に複数年度あれば最新を使う
+
+取得できないとき（ネットワークの制限など）は、[G空間情報センター](https://www.geospatial.jp/ckan/dataset/plateau) から
+該当する市区町村の CityGML を落とし、`udx/bldg` と `udx/tran` の該当メッシュのファイルを `--data-dir` に置けば同じコマンドで動きます。
+`--gml` と一緒に `--place` を渡すと、ダウンロードせずに手元のファイルからその場所を切り出します。
+
+ビューアでは右下の「場所・避難」ウィンドウの「場所を選ぶ」で、住所か緯度経度と半径を入れて「この場所を読み込む」を押すと、
+データを用意してから同じ設定のまま新しい場所で開き直します。
 
 ### まず試す: 銀座 4 丁目交差点（同梱の公式 CityGML 抜粋）
 
@@ -121,7 +145,7 @@ cargo run --release -p plateau-crowd-viewer -- --gml testdata/sample.gml --agent
 | ↑ / ↓ | 再生速度 ×2 / ×½ |
 | H | 通行量ヒートマップの表示切替 |
 
-歩行者は目的地（東西南北の縁）ごとに色分けされ、車は乗用車（4.5m）とトラック（7.5m、1 割）が走ります。歩行者は到着すると別の縁から再投入されます（`--no-respawn` で無効）。
+歩行者は目的地（東西南北の縁）ごとに色分けされ、車は乗用車（4.5m）・トラック（7.5m、1 割）・路線バス（11m、5%、緑）・自転車（15%）が走ります。歩行者は到着すると別の縁から再投入されます（`--no-respawn` で無効）。
 `--map-png` で歩行空間・車道・抽出した道路網を描いた確認用の地図を出力します。`--screenshot out.png 60` でシミュレーション 60 秒時点の画面を保存して終了します（`PLATEAU_SHOW_HEAT=1` でヒートマップ付き、`PLATEAU_CAM="yaw,pitch,距離,x,y"` でカメラ位置指定）。
 
 動画は `--record <出力ディレクトリ> <秒数>` で連番 PNG を書き出し、ffmpeg でつなぎます（`--speed` 再生倍率、`--orbit` カメラ旋回 rad/s、`--warmup` 録画前に進める秒数）。
@@ -132,7 +156,40 @@ cargo run --release -p plateau-crowd-viewer -- --gml testdata/sample.gml --agent
 ffmpeg -framerate 30 -i rec/frame_%05d.png -c:v libx264 -pix_fmt yuv420p sim.mp4
 ```
 
-外部依存は quick-xml / glam / bevy / bevy_egui です。Linux では `libxkbcommon-x11-0` と Vulkan ドライバ（GPU のもの、または `mesa-vulkan-drivers`）が必要です。
+### 車種
+
+| 種別 | 大きさ | 速度 | 走り方 |
+|---|---|---|---|
+| 乗用車 | 4.5 × 1.8m | 制限速度の 70〜100% | 中心線から 1.8m 左 |
+| トラック | 7.5 × 2.3m | 制限速度の 70〜90% | 同上 |
+| バス | 11 × 2.5m | 制限速度の 75〜85% | 約 220m ごとに停留所で 15 秒停車（交差点の手前 8m より前で止まる） |
+| 自転車 | 1.8 × 0.6m | 12〜20km/h | 車道の左端（中心線から 3.0m）。車は自転車の列とは別に追従するので追い越せる |
+
+構成比は `traffic::Params::mix`（`VehicleMix`）で変えられます。CSV の kind 列は `car` / `truck` / `bus` / `bicycle` になります。
+
+### 災害避難モード
+
+避難所を置いて「避難開始」を押すと、範囲内の全員が歩いて最も近い（経路距離が最短の）避難所へ一斉に向かいます。
+
+- 避難所はビューア右下の「災害避難モード」で「緯度,経度[,名前]」を入れて追加するか、**Shift + 左クリック**で地図上に置く。起動時に `--shelter 緯度,経度[,名前]`（複数可）でも指定でき、`--evacuate-at 秒` でその時刻に自動で始まる
+- 避難中は車が減速して左端に寄せて止まり、再投入もしない。歩行者は信号を待たず、車道も通常より通りやすくして（コスト 6 倍 → 1.5 倍）最短で逃げる。車が止まりきったら、止まった車の周りを避ける経路に引き直す
+- 希望歩行速度は通常の 1.2 倍（パネルで 1.0〜1.6 倍）。避難所の半径 4m に入ったら避難完了
+- パネルに経過時間、避難完了人数と割合、50% / 90% / 全員の完了時間、避難所ごとの人数を表示する。「通常に戻す」で最初からやり直す
+
+```sh
+# 銀座: t=30 秒で数寄屋橋公園と銀座東側の 2 か所へ避難
+cargo run --release -- --place 35.67165,139.765 --radius 200 --data-dir testdata --agents 1500 --vehicles 60 \
+    --shelter 35.6725,139.7637,数寄屋橋公園 --shelter 35.6705,139.7668,銀座東 --evacuate-at 30 --duration 900
+# → 避難: 完了 1388/1389 人, 50% 108 秒 / 90% 213 秒（数寄屋橋公園 903 人, 銀座東 485 人）
+# 　まれに車と建物の狭い隙間で動けなくなる人が残る（下の「既知の制限」）
+```
+
+![evacuation](docs/evacuation.png)
+
+既知の制限: 避難所の受け入れ人数（定員）や建物からの出発は扱っていない。止まった車と建物の狭い隙間に入り込んだ人が
+まれに動けなくなる（銀座 1500 人で 0〜3 人）。
+
+外部依存は quick-xml / glam / bevy / bevy_egui / ureq / serde_json です。Linux では `libxkbcommon-x11-0` と Vulkan ドライバ（GPU のもの、または `mesa-vulkan-drivers`）が必要です。
 
 ![viewer](docs/viewer.png)
 
@@ -224,7 +281,10 @@ cargo run --release -- --gml testdata/ginza/53394601_bldg_6697_op.gml --gml test
 - [x] 可視化: bevy で 3D 建物 + エージェントのリアルタイム表示
 - [ ] 可視化の拡張: LOD2 の屋根形状・テクスチャ、地形 (dem)、wasm + WebGPU でブラウザ表示
 - [ ] 速度向上: rayon による並列化、密度に応じた計算（数万人規模）
-- [ ] 評価指標: 密度（人/m²）、流量、サービス水準 (LOS)、避難完了時間
+- [ ] 評価指標: 密度（人/m²）、流量、サービス水準 (LOS)（避難完了時間は避難モードで出せる）
+- [x] 災害避難モード: 最寄りの避難所へ一斉に移動、車は停止、完了時間の集計
+- [x] 場所の指定: 住所 / 緯度経度から PLATEAU の CityGML を取得・切り出し
+- [x] 車種: バス（停留所停車）・自転車（車道左端）
 - [x] 車両: 道路網抽出、IDM、交差点の通行権、歩行者との相互作用
-- [ ] 信号機・横断歩道、車線数（多車線・右左折レーン）、駐車・路線バス
+- [ ] 信号機・横断歩道、車線数（多車線・右左折レーン）、駐車、バスの系統・実際の停留所位置
 - [ ] 階段・建物入口の扱い、歩道の植栽・街路樹（AuxiliaryTrafficArea の種別）の反映

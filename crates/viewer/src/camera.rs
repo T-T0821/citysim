@@ -18,13 +18,16 @@ pub struct UiCapture(pub bool);
 pub fn orbit_camera(
     ui: Res<UiCapture>,
     buttons: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
     motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
     mut q: Query<(&mut OrbitCamera, &mut Transform)>,
 ) {
     for (mut cam, mut tf) in &mut q {
         let d = if ui.0 { Vec2::ZERO } else { motion.delta };
-        if buttons.pressed(MouseButton::Left) {
+        // Shift + 左クリックは避難所の追加に使うので回転しない
+        let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+        if buttons.pressed(MouseButton::Left) && !shift {
             cam.yaw -= d.x * 0.005;
             cam.pitch = (cam.pitch + d.y * 0.005).clamp(0.05, 1.55);
         }

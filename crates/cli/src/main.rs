@@ -35,6 +35,11 @@ struct Args {
     compare: bool,
     /// 信号機（None = 信号なし）
     signals: Option<traffic::SignalConfig>,
+    place: Option<String>,
+    radius: f64,
+    data_dir: PathBuf,
+    shelters: Vec<(String, f64, f64)>,
+    evacuate_at: Option<f32>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -58,6 +63,11 @@ fn parse_args() -> Result<Args> {
         zone_size: None,
         compare: false,
         signals: Some(traffic::SignalConfig::default()),
+        place: None,
+        radius: 220.0,
+        data_dir: PathBuf::from("data/plateau"),
+        shelters: vec![],
+        evacuate_at: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -156,25 +166,58 @@ fn parse_args() -> Result<Args> {
                     c.ped_green = x;
                 }
             }
+            // 場所（住所 or 緯度,経度）。--gml が無ければ PLATEAU の CityGML を自動で取得する
+            "--place" => a.place = Some(v()?),
+            "--radius" => a.radius = v()?.parse()?,
+            "--data-dir" => a.data_dir = v()?.into(),
+            // 避難所: 緯度,経度[,名前]（複数可）
+            "--shelter" => a.shelters.push(parse_shelter(&v()?)?),
+            // 避難開始時刻 [s]（--shelter があれば既定 0）
+            "--evacuate-at" => a.evacuate_at = Some(v()?.parse()?),
             "-h" | "--help" => {
                 println!(
-                    "usage: plateau-crowd (--gml <file|dir> | --obj <file|dir> --obj-origin 緯度,経度)... [--crop 緯度,経度,半径m] [--agents N] [--vehicles N] [--cell M] [--duration S] [--dt S]\n\
+                    "usage: plateau-crowd (--gml <file|dir> | --obj <file|dir> --obj-origin 緯度,経度 | --place <住所|緯度,経度>)... [--crop 緯度,経度,半径m] [--agents N] [--vehicles N] [--cell M] [--duration S] [--dt S]\n\
                      \x20                    [--seed N] [--csv out.csv] [--csv-every S] [--png heatmap.png] [--map-png map.png]\n\
                      \x20                    [--scenario scenario.toml] [--export <dir>] [--zone-size M] [--compare]\n\
-                     \x20                    [--signals auto|concurrent|exclusive|scramble|off] [--cycle S] [--main-split 0.6] [--ped-green S]"
+                     \x20                    [--signals auto|concurrent|exclusive|scramble|off] [--cycle S] [--main-split 0.6] [--ped-green S]\n\
+                     \x20                    [--radius m] [--data-dir data/plateau] [--shelter 緯度,経度[,名前]]... [--evacuate-at 秒]"
                 );
                 std::process::exit(0);
             }
             _ => bail!("不明な引数: {k}"),
         }
     }
+    if let Some(place) = a.place.clone() {
+        let p = if a.gml.is_empty() && a.obj.is_empty() {
+            // 入力が無ければ PLATEAU から取得（手元の --data-dir にあればそれを使う）
+            let r = plateau_fetch::prepare(&place, a.radius, &a.data_dir, &mut |m| eprintln!("{m}"))?;
+            a.gml.extend(r.files);
+            r.place
+        } else {
+            plateau_fetch::resolve_place(&place)?
+        };
+        a.crop = Some((p.lat, p.lon, a.radius));
+    }
     if a.gml.is_empty() && a.obj.is_empty() {
-        bail!("--gml か --obj を 1 つ以上指定してください (--help)");
+        bail!("--gml か --obj か --place を指定してください (--help)");
     }
     if !a.obj.is_empty() && a.obj_origin.is_none() {
         bail!("--obj には --obj-origin 緯度,経度 が必要です");
     }
     Ok(a)
+}
+
+fn parse_shelter(s: &str) -> Result<(String, f64, f64)> {
+    let t: Vec<&str> = s.splitn(3, ',').collect();
+    if t.len() < 2 {
+        bail!("--shelter は 緯度,経度[,名前]: {s}");
+    }
+    let (lat, lon) = (t[0].trim().parse()?, t[1].trim().parse()?);
+    let name = t.get(2).map_or_else(
+        || format!("避難所({lat:.5},{lon:.5})"),
+        |n| n.trim().to_string(),
+    );
+    Ok((name, lat, lon))
 }
 
 fn parse_pair(s: &str) -> Result<(f64, f64)> {
@@ -480,6 +523,33 @@ fn simulate(
         },
         traffic.as_ref().map_or(0, |t| t.vehicles.len())
     );
+    if let Some(t) = &traffic {
+        let mut n = std::collections::BTreeMap::new();
+        for v in &t.vehicles {
+            *n.entry(v.kind.label_ja()).or_insert(0) += 1;
+        }
+        eprintln!(
+            "車種: {}",
+            n.iter()
+                .map(|(k, c)| format!("{k} {c}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let shelters: Vec<(String, glam::Vec2)> = args
+        .shelters
+        .iter()
+        .map(|(n, lat, lon)| {
+            let g = plateau_gml::GeoPoint {
+                lat: *lat,
+                lon: *lon,
+                h: 0.0,
+            };
+            (n.clone(), sim.grid.projection.to_local(&g))
+        })
+        .collect();
+    let evacuate_at = (!shelters.is_empty()).then(|| args.evacuate_at.unwrap_or(0.0));
+    let mut evac: Option<crowd::evacuation::Evacuation> = None;
     let n_initial = sim.agents.len();
     // 発生源の折れ線が終わるまでは、全員到着しても止めない
     let spawn_until = sc.map_or(0.0, |s| s.last_time());
@@ -508,8 +578,13 @@ fn simulate(
                     let vel = v.heading * v.v;
                     writeln!(
                         f,
-                        "{:.2},car,{i},{lat:.8},{lon:.8},{:.3},{:.3},{:.3},{:.3}",
-                        sim.time, v.pos.x, v.pos.y, vel.x, vel.y
+                        "{:.2},{},{i},{lat:.8},{lon:.8},{:.3},{:.3},{:.3},{:.3}",
+                        sim.time,
+                        v.kind.name(),
+                        v.pos.x,
+                        v.pos.y,
+                        vel.x,
+                        vel.y
                     )?;
                 }
             }
@@ -519,7 +594,44 @@ fn simulate(
                 heat[sim.grid.idx(x, y)] += 1;
             }
         }
-        if s == steps || (sim.active() == 0 && sim.time >= spawn_until) {
+        if let (Some(at), None) = (evacuate_at, &evac) {
+            if sim.time + 1e-4 >= at {
+                let ev = crowd::evacuation::Evacuation::start(
+                    &mut sim,
+                    &shelters,
+                    &Default::default(),
+                )
+                .context("避難所の近くに歩行空間がありません（範囲外か建物の中）")?;
+                eprintln!(
+                    "避難開始: t={:.1}s, 対象 {} 人, 避難所 {} か所{}",
+                    sim.time,
+                    ev.total,
+                    ev.shelters.len(),
+                    if ev.unreachable > 0 {
+                        format!("（到達できない人 {}）", ev.unreachable)
+                    } else {
+                        String::new()
+                    }
+                );
+                if let Some(t) = traffic.as_mut() {
+                    t.halted = true;
+                }
+                evac = Some(ev);
+            }
+        }
+        if let Some(ev) = evac.as_mut() {
+            // 車が止まりきったら、止まった車を避ける経路に引き直す
+            if let (false, Some(t)) = (ev.rerouted, &traffic) {
+                if t.vehicles.iter().all(|v| !v.active || v.v == 0.0) {
+                    ev.reroute_around(&mut sim, &t.obstacles());
+                }
+            }
+            ev.update(&sim);
+            if ev.done() {
+                break;
+            }
+        }
+        if s == steps || (sim.active() == 0 && sim.time >= spawn_until && evac.is_none()) {
             break;
         }
         if let Some(t) = traffic.as_mut() {
@@ -531,11 +643,13 @@ fn simulate(
                 .collect();
             t.step(args.dt, &peds);
             sim.obstacles = t.obstacles();
-            if let Some(s) = &t.signals {
+            // 避難中（車が止まっている間）は信号に関係なく渡る
+            if let (Some(s), false) = (&t.signals, t.halted) {
                 s.write_closed(t.time, &mut sim.closed);
             }
         }
-        if let (Some(sp), Some(sc)) = (spawner.as_mut(), sc) {
+        // 避難中は発生源から新しい人を出さない
+        if let (Some(sp), Some(sc), None) = (spawner.as_mut(), sc, &evac) {
             sp.step(sc, &mut sim, args.dt, 1.0);
         }
         sim.step(args.dt);
@@ -563,6 +677,20 @@ fn simulate(
         t_sim.elapsed(),
         sim.time / t_sim.elapsed().as_secs_f32()
     );
+    if let Some(ev) = &evac {
+        let fmt = |t: Option<f32>| t.map_or("未完了".to_string(), |t| format!("{t:.0} 秒"));
+        eprintln!(
+            "避難: 完了 {}/{} 人, 50% {} / 90% {} / 全員 {}",
+            ev.evacuated(),
+            ev.total - ev.unreachable,
+            fmt(ev.time_to_fraction(0.5)),
+            fmt(ev.time_to_fraction(0.9)),
+            fmt(ev.time_to_fraction(1.0)),
+        );
+        for s in &ev.shelters {
+            eprintln!("  {}: {} 人", s.name, s.arrived);
+        }
+    }
     Ok(RunOut {
         sim,
         heat,
