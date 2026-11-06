@@ -1,0 +1,9 @@
+[package]
+name = "plateau-gml"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+quick-xml.workspace = true
+anyhow.workspace = true

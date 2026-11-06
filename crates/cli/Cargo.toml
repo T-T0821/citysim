@@ -1,0 +1,17 @@
+[package]
+name = "plateau-crowd"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "plateau-crowd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+glam.workspace = true
+plateau-gml.workspace = true
+walkmap.workspace = true
+crowd.workspace = true
+traffic.workspace = true

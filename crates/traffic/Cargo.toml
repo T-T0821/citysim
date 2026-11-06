@@ -1,0 +1,12 @@
+[package]
+name = "traffic"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+glam.workspace = true
+walkmap.workspace = true
+
+[dev-dependencies]
+plateau-gml.workspace = true
