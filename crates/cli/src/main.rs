@@ -27,6 +27,8 @@ struct Args {
     csv_every: f32,
     png: Option<PathBuf>,
     map_png: Option<PathBuf>,
+    /// 信号機（None = 信号なし）
+    signals: Option<traffic::SignalConfig>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -45,6 +47,7 @@ fn parse_args() -> Result<Args> {
         csv_every: 1.0,
         png: None,
         map_png: None,
+        signals: Some(traffic::SignalConfig::default()),
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -102,10 +105,44 @@ fn parse_args() -> Result<Args> {
             "--png" => a.png = Some(v()?.into()),
             // 歩行空間・車道・道路網を描いた確認用の地図（北が上）
             "--map-png" => a.map_png = Some(v()?.into()),
+            // 信号機: auto（既定, 大交差点はスクランブル）| concurrent | exclusive | scramble | off
+            "--signals" => {
+                let m = v()?;
+                a.signals = if m == "off" {
+                    None
+                } else {
+                    let mode = traffic::PedMode::parse(&m).with_context(|| {
+                        format!("--signals は auto|concurrent|exclusive|scramble|off: {m}")
+                    })?;
+                    Some(traffic::SignalConfig {
+                        mode,
+                        ..a.signals.unwrap_or_default()
+                    })
+                };
+            }
+            "--cycle" => {
+                let x = v()?.parse()?;
+                if let Some(c) = a.signals.as_mut() {
+                    c.cycle = x;
+                }
+            }
+            "--main-split" => {
+                let x = v()?.parse()?;
+                if let Some(c) = a.signals.as_mut() {
+                    c.main_split = x;
+                }
+            }
+            "--ped-green" => {
+                let x = v()?.parse()?;
+                if let Some(c) = a.signals.as_mut() {
+                    c.ped_green = x;
+                }
+            }
             "-h" | "--help" => {
                 println!(
                     "usage: plateau-crowd (--gml <file|dir> | --obj <file|dir> --obj-origin 緯度,経度)... [--crop 緯度,経度,半径m] [--agents N] [--vehicles N] [--cell M] [--duration S] [--dt S]\n\
-                     \x20                    [--seed N] [--csv out.csv] [--csv-every S] [--png heatmap.png]"
+                     \x20                    [--seed N] [--csv out.csv] [--csv-every S] [--png heatmap.png] [--map-png map.png]\n\
+                     \x20                    [--signals auto|concurrent|exclusive|scramble|off] [--cycle S] [--main-split 0.6] [--ped-green S]"
                 );
                 std::process::exit(0);
             }
@@ -195,12 +232,8 @@ fn main() -> Result<()> {
         );
     }
 
-    let mut traffic = if args.vehicles > 0 && grid.has_roads {
+    let mut traffic = if (args.vehicles > 0 || args.signals.is_some()) && grid.has_roads {
         let net = traffic::RoadGraph::from_grid(&grid, crowd::scenario::SIDEWALK_W);
-        if let Some(p) = &args.map_png {
-            write_map(&grid, Some(&net), p)?;
-            eprintln!("地図: {}", p.display());
-        }
         eprintln!(
             "道路網: 交差点 {} か所, 出入口 {} か所, 区間 {} 本",
             net.nodes.iter().filter(|n| n.edges.len() >= 3).count(),
@@ -209,15 +242,36 @@ fn main() -> Result<()> {
         );
         Some(traffic::Traffic::new(net, args.vehicles, args.seed))
     } else {
-        if let Some(p) = &args.map_png {
-            write_map(&grid, None, p)?;
-            eprintln!("地図: {}", p.display());
-        }
         None
     };
 
     let (mut sim, goal_names) = crowd::scenario::through_traffic(grid, args.agents, args.seed)
         .context("範囲の縁に歩行可能領域がありません")?;
+    if let (Some(t), Some(cfg)) = (traffic.as_mut(), &args.signals) {
+        let s = traffic::Signals::build(&t.graph, &sim.grid, cfg.clone());
+        let n_scr = s
+            .intersections
+            .iter()
+            .filter(|i| i.plan == traffic::signal::Plan::Scramble)
+            .count();
+        eprintln!(
+            "信号: {} か所（うちスクランブル {} か所）, 横断歩道 {} か所",
+            s.intersections.len(),
+            n_scr,
+            s.intersections
+                .iter()
+                .map(|i| i.crosswalks.len())
+                .sum::<usize>()
+        );
+        s.apply_walk_costs(&mut sim.grid);
+        sim.recompute_flows();
+        sim.closed = vec![false; sim.grid.w * sim.grid.h];
+        t.set_signals(Some(s));
+    }
+    if let Some(p) = &args.map_png {
+        write_map(&sim.grid, traffic.as_ref(), p)?;
+        eprintln!("地図: {}", p.display());
+    }
     eprintln!("目的地: {}", goal_names.join(", "));
     eprintln!(
         "歩行者: {} 人, 車両: {} 台",
@@ -279,6 +333,9 @@ fn main() -> Result<()> {
                 .collect();
             t.step(args.dt, &peds);
             sim.obstacles = t.obstacles();
+            if let Some(s) = &t.signals {
+                s.write_closed(t.time, &mut sim.closed);
+            }
         }
         sim.step(args.dt);
     }
@@ -300,11 +357,13 @@ fn main() -> Result<()> {
 }
 
 /// 確認用の地図（北が上）。緑=地面, 灰=歩行可能, 黒=建物, 濃灰=車道, 白=道路中心線, 赤=交差点, 青=出入口。
+/// 信号があれば 縞=横断歩道, 黄=停止線, 紫=スクランブルの交差点内。
 fn write_map(
     grid: &WalkGrid,
-    net: Option<&traffic::RoadGraph>,
+    traffic: Option<&traffic::Traffic>,
     path: &std::path::Path,
 ) -> Result<()> {
+    let net = traffic.map(|t| &t.graph);
     let (w, h) = (grid.w, grid.h);
     let mut img = vec![0u8; w * h * 3];
     let mut put = |x: i64, y: i64, c: [u8; 3]| {
@@ -338,6 +397,35 @@ fn write_map(
             walkmap::fill_polygon(p, grid.origin, grid.cell, w, h, |i| {
                 put((i % w) as i64, (i / w) as i64, [25, 25, 30]);
             });
+        }
+    }
+    if let Some(s) = traffic.and_then(|t| t.signals.as_ref()) {
+        for inter in &s.intersections {
+            if inter.plan == traffic::signal::Plan::Scramble {
+                for &i in &inter.interior {
+                    let i = i as usize;
+                    put((i % w) as i64, (i / w) as i64, [110, 80, 130]);
+                }
+            }
+            for cw in &inter.crosswalks {
+                for &i in &cw.cells {
+                    let i = i as usize;
+                    let q = grid.center(i % w, i / w) - cw.center;
+                    // 横断方向に 0.5m おきの縞
+                    if (q.dot(cw.across) / 0.5).floor() as i64 % 2 == 0 {
+                        put((i % w) as i64, (i / w) as i64, [235, 235, 235]);
+                    }
+                }
+            }
+            for ap in &inter.approaches {
+                let n = ap.dir.perp();
+                let mut d = -ap.width.1;
+                while d <= ap.width.0 {
+                    let p = (ap.stop_pos + n * d - grid.origin) / grid.cell;
+                    put(p.x as i64, p.y as i64, [250, 200, 30]);
+                    d += grid.cell * 0.5;
+                }
+            }
         }
     }
     if let Some(net) = net {
