@@ -5,6 +5,7 @@
 //! - 他者からの反発: 指数関数的な心理的反発 + 接触時の物理力
 //! - 壁からの反発: 障害物距離場の勾配方向
 
+pub mod evacuation;
 pub mod scenario;
 
 use glam::Vec2;
@@ -140,6 +141,17 @@ impl Simulation {
                     p.a_wall * 2.0 * (overlap / 0.5).exp() + p.k_body * 2.0 * overlap.max(0.0);
                 // 押し付けられて壁際で動けなくならないよう上限を設ける
                 f += n * mag.min(40.0);
+                // 行く手をふさぐ車は車体に沿って回り込む（止まった車の前で押し合って動けなくならない）
+                let ahead = e.dot(-n);
+                if ahead > 0.0 && dist < r + 1.5 {
+                    let axis = ab.try_normalize().unwrap_or(n.perp());
+                    let side = if axis.dot(e).abs() > 0.1 {
+                        axis.dot(e).signum()
+                    } else {
+                        1.0
+                    };
+                    f += axis * side * (ahead * a.desired_speed / p.tau);
+                }
             }
             acc[i] = f;
         }
