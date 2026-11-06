@@ -7,6 +7,8 @@
 mod png;
 
 use anyhow::{bail, Context, Result};
+use crowd::event::{Scenario, ScenarioFile};
+use crowd::report::ZoneStats;
 use crowd::Simulation;
 use std::io::Write;
 use std::path::PathBuf;
@@ -17,23 +19,27 @@ struct Args {
     obj: Vec<PathBuf>,
     obj_origin: Option<(f64, f64)>,
     crop: Option<(f64, f64, f64)>,
-    agents: usize,
-    vehicles: usize,
+    agents: Option<usize>,
+    vehicles: Option<usize>,
     cell: f32,
-    duration: f32,
+    duration: Option<f32>,
     dt: f32,
     seed: u64,
     csv: Option<PathBuf>,
     csv_every: f32,
     png: Option<PathBuf>,
     map_png: Option<PathBuf>,
+    scenario: Option<PathBuf>,
+    export: Option<PathBuf>,
+    zone_size: Option<f32>,
+    compare: bool,
+    /// 信号機（None = 信号なし）
+    signals: Option<traffic::SignalConfig>,
     place: Option<String>,
     radius: f64,
     data_dir: PathBuf,
     shelters: Vec<(String, f64, f64)>,
     evacuate_at: Option<f32>,
-    /// 信号機（None = 信号なし）
-    signals: Option<traffic::SignalConfig>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -42,22 +48,26 @@ fn parse_args() -> Result<Args> {
         obj: vec![],
         obj_origin: None,
         crop: None,
-        agents: 300,
-        vehicles: 40,
+        agents: None,
+        vehicles: None,
         cell: 0.5,
-        duration: 300.0,
+        duration: None,
         dt: 0.05,
         seed: 1,
         csv: None,
         csv_every: 1.0,
         png: None,
         map_png: None,
+        scenario: None,
+        export: None,
+        zone_size: None,
+        compare: false,
+        signals: Some(traffic::SignalConfig::default()),
         place: None,
         radius: 220.0,
         data_dir: PathBuf::from("data/plateau"),
         shelters: vec![],
         evacuate_at: None,
-        signals: Some(traffic::SignalConfig::default()),
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -104,10 +114,10 @@ fn parse_args() -> Result<Args> {
                 }
                 a.crop = Some((x[0], x[1], x[2]));
             }
-            "--agents" => a.agents = v()?.parse()?,
-            "--vehicles" => a.vehicles = v()?.parse()?,
+            "--agents" => a.agents = Some(v()?.parse()?),
+            "--vehicles" => a.vehicles = Some(v()?.parse()?),
             "--cell" => a.cell = v()?.parse()?,
-            "--duration" => a.duration = v()?.parse()?,
+            "--duration" => a.duration = Some(v()?.parse()?),
             "--dt" => a.dt = v()?.parse()?,
             "--seed" => a.seed = v()?.parse()?,
             "--csv" => a.csv = Some(v()?.into()),
@@ -115,14 +125,14 @@ fn parse_args() -> Result<Args> {
             "--png" => a.png = Some(v()?.into()),
             // 歩行空間・車道・道路網を描いた確認用の地図（北が上）
             "--map-png" => a.map_png = Some(v()?.into()),
-            // 場所（住所 or 緯度,経度）。--gml が無ければ PLATEAU の CityGML を自動で取得する
-            "--place" => a.place = Some(v()?),
-            "--radius" => a.radius = v()?.parse()?,
-            "--data-dir" => a.data_dir = v()?.into(),
-            // 避難所: 緯度,経度[,名前]（複数可）
-            "--shelter" => a.shelters.push(parse_shelter(&v()?)?),
-            // 避難開始時刻 [s]（--shelter があれば既定 0）
-            "--evacuate-at" => a.evacuate_at = Some(v()?.parse()?),
+            // イベント・混雑シナリオ／通行止めの設定ファイル（TOML, scenarios/ を参照）
+            "--scenario" => a.scenario = Some(v()?.into()),
+            // 区画ごとの集計 CSV・画像を書き出すディレクトリ
+            "--export" => a.export = Some(v()?.into()),
+            // 集計区画の一辺 [m]（既定 20）
+            "--zone-size" => a.zone_size = Some(v()?.parse()?),
+            // 通行止めなし（Before）とあり（After）を続けて計算し、差分を出力する
+            "--compare" => a.compare = true,
             // 信号機: auto（既定, 大交差点はスクランブル）| concurrent | exclusive | scramble | off
             "--signals" => {
                 let m = v()?;
@@ -156,10 +166,19 @@ fn parse_args() -> Result<Args> {
                     c.ped_green = x;
                 }
             }
+            // 場所（住所 or 緯度,経度）。--gml が無ければ PLATEAU の CityGML を自動で取得する
+            "--place" => a.place = Some(v()?),
+            "--radius" => a.radius = v()?.parse()?,
+            "--data-dir" => a.data_dir = v()?.into(),
+            // 避難所: 緯度,経度[,名前]（複数可）
+            "--shelter" => a.shelters.push(parse_shelter(&v()?)?),
+            // 避難開始時刻 [s]（--shelter があれば既定 0）
+            "--evacuate-at" => a.evacuate_at = Some(v()?.parse()?),
             "-h" | "--help" => {
                 println!(
                     "usage: plateau-crowd (--gml <file|dir> | --obj <file|dir> --obj-origin 緯度,経度 | --place <住所|緯度,経度>)... [--crop 緯度,経度,半径m] [--agents N] [--vehicles N] [--cell M] [--duration S] [--dt S]\n\
                      \x20                    [--seed N] [--csv out.csv] [--csv-every S] [--png heatmap.png] [--map-png map.png]\n\
+                     \x20                    [--scenario scenario.toml] [--export <dir>] [--zone-size M] [--compare]\n\
                      \x20                    [--signals auto|concurrent|exclusive|scramble|off] [--cycle S] [--main-split 0.6] [--ped-green S]\n\
                      \x20                    [--radius m] [--data-dir data/plateau] [--shelter 緯度,経度[,名前]]... [--evacuate-at 秒]"
                 );
@@ -194,7 +213,10 @@ fn parse_shelter(s: &str) -> Result<(String, f64, f64)> {
         bail!("--shelter は 緯度,経度[,名前]: {s}");
     }
     let (lat, lon) = (t[0].trim().parse()?, t[1].trim().parse()?);
-    let name = t.get(2).map_or_else(|| format!("避難所({lat:.5},{lon:.5})"), |n| n.trim().to_string());
+    let name = t.get(2).map_or_else(
+        || format!("避難所({lat:.5},{lon:.5})"),
+        |n| n.trim().to_string(),
+    );
     Ok((name, lat, lon))
 }
 
@@ -272,20 +294,190 @@ fn main() -> Result<()> {
         );
     }
 
-    let mut traffic = if (args.vehicles > 0 || args.signals.is_some()) && grid.has_roads {
-        let net = traffic::RoadGraph::from_grid(&grid, crowd::scenario::SIDEWALK_W);
+    let scenario = match &args.scenario {
+        Some(p) => {
+            let f = ScenarioFile::load(p).map_err(anyhow::Error::msg)?;
+            let sc = Scenario::from_file(&f, &grid.projection).map_err(anyhow::Error::msg)?;
+            eprintln!(
+                "シナリオ: {} (発生源 {} か所, 行き先 {} か所, 通行止め {} か所)",
+                if sc.name.is_empty() {
+                    "(無名)"
+                } else {
+                    &sc.name
+                },
+                sc.sources.len(),
+                sc.destinations.len(),
+                sc.closures.len()
+            );
+            Some(sc)
+        }
+        None => None,
+    };
+    let opts = RunOpts {
+        agents: args
+            .agents
+            .or(scenario.as_ref().and_then(|s| s.background_agents))
+            .unwrap_or(300),
+        vehicles: args
+            .vehicles
+            .or(scenario.as_ref().and_then(|s| s.vehicles))
+            .unwrap_or(40),
+        duration: args
+            .duration
+            .or(scenario.as_ref().and_then(|s| s.duration))
+            .unwrap_or(300.0),
+        zone_size: args
+            .zone_size
+            .or(scenario.as_ref().and_then(|s| s.zone_size))
+            .unwrap_or(20.0),
+    };
+
+    let net = ((opts.vehicles > 0 || args.signals.is_some()) && grid.has_roads)
+        .then(|| traffic::RoadGraph::from_grid(&grid, crowd::scenario::SIDEWALK_W));
+    if let Some(net) = &net {
         eprintln!(
             "道路網: 交差点 {} か所, 出入口 {} か所, 区間 {} 本",
             net.nodes.iter().filter(|n| n.edges.len() >= 3).count(),
             net.nodes.iter().filter(|n| n.border).count(),
             net.edges.len()
         );
-        Some(traffic::Traffic::new(net, args.vehicles, args.seed))
-    } else {
-        None
-    };
+    }
 
-    let (mut sim, goal_names) = crowd::scenario::through_traffic(grid, args.agents, args.seed)
+    // --compare: まず通行止めなしで計算して Before にする
+    let before = match &scenario {
+        Some(sc) if args.compare => {
+            eprintln!("--- Before（通行止めなし） ---");
+            let mut open = sc.clone();
+            open.closures_on = false;
+            Some(simulate(
+                &args,
+                &opts,
+                &grid,
+                net.as_ref(),
+                Some(&open),
+                None,
+                None,
+            )?)
+        }
+        _ => {
+            if args.compare {
+                bail!("--compare には --scenario（通行止めを含むもの）が必要です");
+            }
+            None
+        }
+    };
+    if before.is_some() {
+        eprintln!("--- After（通行止めあり） ---");
+    }
+
+    let mut csv = match &args.csv {
+        Some(p) => {
+            let mut f = std::io::BufWriter::new(std::fs::File::create(p)?);
+            writeln!(f, "t,kind,id,lat,lon,x,y,vx,vy")?;
+            Some(f)
+        }
+        None => None,
+    };
+    let after = simulate(
+        &args,
+        &opts,
+        &grid,
+        net.as_ref(),
+        scenario.as_ref(),
+        csv.as_mut().map(|f| f as &mut dyn Write),
+        args.map_png.as_deref(),
+    )?;
+
+    if let Some(p) = &args.png {
+        write_heatmap(&after.sim, &after.heat, p)?;
+        eprintln!("ヒートマップ: {}", p.display());
+    }
+    if let Some(dir) = &args.export {
+        let clock = |t: f32| match &scenario {
+            Some(sc) => sc.clock_label(t),
+            None => format!("{t:.0} s"),
+        };
+        let files = after.stats.export_dir(
+            &after.sim.grid,
+            dir,
+            before.as_ref().map(|b| &b.stats),
+            &after.closed,
+            clock,
+        )?;
+        if let Some(b) = &before {
+            b.stats
+                .export_dir(&b.sim.grid, &dir.join("before"), None, &[], clock)?;
+        }
+        eprintln!(
+            "エクスポート: {} ({}{})",
+            dir.display(),
+            files.join(", "),
+            if before.is_some() { ", before/" } else { "" }
+        );
+    }
+    if let Some(b) = &before {
+        print_compare(&b.stats, &after.stats);
+    }
+    Ok(())
+}
+
+struct RunOpts {
+    agents: usize,
+    vehicles: usize,
+    duration: f32,
+    zone_size: f32,
+}
+
+struct RunOut {
+    sim: Simulation,
+    heat: Vec<u32>,
+    stats: ZoneStats,
+    /// 通行止めで通れなくなったセル
+    closed: Vec<bool>,
+}
+
+/// 1 回分のシミュレーション。シナリオがあれば通行止めを反映し、発生源から人を出す。
+fn simulate(
+    args: &Args,
+    opts: &RunOpts,
+    base: &WalkGrid,
+    net: Option<&traffic::RoadGraph>,
+    sc: Option<&Scenario>,
+    mut csv: Option<&mut dyn Write>,
+    map_png: Option<&std::path::Path>,
+) -> Result<RunOut> {
+    let mut grid = base.clone();
+    if let Some(sc) = sc {
+        let n = sc.apply_closures(&mut grid);
+        if n > 0 {
+            eprintln!(
+                "通行止め: {} か所, 通れなくした面積 {:.0} m²",
+                sc.active_closures().count(),
+                n as f32 * grid.cell * grid.cell
+            );
+        }
+    }
+    let closed: Vec<bool> = base
+        .walkable
+        .iter()
+        .zip(&grid.walkable)
+        .map(|(&a, &b)| a && !b)
+        .collect();
+    let mut traffic = net.map(|n| {
+        let n = match sc {
+            Some(sc) => {
+                let g = n.retain_edges(|e| !sc.blocks_road(&e.pts));
+                if g.edges.len() < n.edges.len() {
+                    eprintln!("車両通行止め: 区間 {} 本", n.edges.len() - g.edges.len());
+                }
+                g
+            }
+            None => n.clone(),
+        };
+        traffic::Traffic::new(n, opts.vehicles, args.seed)
+    });
+
+    let (mut sim, goal_names) = crowd::scenario::through_traffic(grid, opts.agents, args.seed)
         .context("範囲の縁に歩行可能領域がありません")?;
     if let (Some(t), Some(cfg)) = (traffic.as_mut(), &args.signals) {
         let s = traffic::Signals::build(&t.graph, &sim.grid, cfg.clone());
@@ -308,25 +500,29 @@ fn main() -> Result<()> {
         sim.closed = vec![false; sim.grid.w * sim.grid.h];
         t.set_signals(Some(s));
     }
-    if let Some(p) = &args.map_png {
-        write_map(&sim.grid, traffic.as_ref(), p)?;
+    if let Some(p) = map_png {
+        write_map(&sim.grid, traffic.as_ref(), sc, p)?;
         eprintln!("地図: {}", p.display());
     }
-    eprintln!("目的地: {}", goal_names.join(", "));
-    eprintln!(
-        "歩行者: {} 人, 車両: {} 台",
-        sim.agents.len(),
-        traffic.as_ref().map_or(0, |t| t.vehicles.len())
-    );
-
-    let mut csv = match &args.csv {
-        Some(p) => {
-            let mut f = std::io::BufWriter::new(std::fs::File::create(p)?);
-            writeln!(f, "t,kind,id,lat,lon,x,y,vx,vy")?;
-            Some(f)
-        }
+    let mut goal_names: Vec<String> = goal_names.iter().map(|s| s.to_string()).collect();
+    let mut spawner = match sc {
+        Some(sc) => Some(
+            sc.install(&mut sim, &mut goal_names, args.seed)
+                .map_err(anyhow::Error::msg)?,
+        ),
         None => None,
     };
+    eprintln!("目的地: {}", goal_names.join(", "));
+    eprintln!(
+        "歩行者: {} 人{}, 車両: {} 台",
+        sim.agents.len(),
+        if spawner.is_some() {
+            "（＋発生源から）"
+        } else {
+            ""
+        },
+        traffic.as_ref().map_or(0, |t| t.vehicles.len())
+    );
     if let Some(t) = &traffic {
         let mut n = std::collections::BTreeMap::new();
         for v in &t.vehicles {
@@ -334,19 +530,33 @@ fn main() -> Result<()> {
         }
         eprintln!(
             "車種: {}",
-            n.iter().map(|(k, c)| format!("{k} {c}")).collect::<Vec<_>>().join(", ")
+            n.iter()
+                .map(|(k, c)| format!("{k} {c}"))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     let shelters: Vec<(String, glam::Vec2)> = args
         .shelters
         .iter()
-        .map(|(n, lat, lon)| (n.clone(), sim.grid.projection.to_local(&plateau_gml::GeoPoint { lat: *lat, lon: *lon, h: 0.0 })))
+        .map(|(n, lat, lon)| {
+            let g = plateau_gml::GeoPoint {
+                lat: *lat,
+                lon: *lon,
+                h: 0.0,
+            };
+            (n.clone(), sim.grid.projection.to_local(&g))
+        })
         .collect();
     let evacuate_at = (!shelters.is_empty()).then(|| args.evacuate_at.unwrap_or(0.0));
     let mut evac: Option<crowd::evacuation::Evacuation> = None;
+    let n_initial = sim.agents.len();
+    // 発生源の折れ線が終わるまでは、全員到着しても止めない
+    let spawn_until = sc.map_or(0.0, |s| s.last_time());
 
+    let mut stats = ZoneStats::new(&sim.grid, opts.zone_size);
     let mut heat = vec![0u32; sim.grid.w * sim.grid.h];
-    let steps = (args.duration / args.dt).round() as usize;
+    let steps = (opts.duration / args.dt).round() as usize;
     let csv_stride = ((args.csv_every / args.dt).round() as usize).max(1);
     let t_sim = std::time::Instant::now();
     for s in 0..=steps {
@@ -421,7 +631,7 @@ fn main() -> Result<()> {
                 break;
             }
         }
-        if s == steps || sim.active() == 0 {
+        if s == steps || (sim.active() == 0 && sim.time >= spawn_until && evac.is_none()) {
             break;
         }
         if let Some(t) = traffic.as_mut() {
@@ -438,18 +648,35 @@ fn main() -> Result<()> {
                 s.write_closed(t.time, &mut sim.closed);
             }
         }
+        // 避難中は発生源から新しい人を出さない
+        if let (Some(sp), Some(sc), None) = (spawner.as_mut(), sc, &evac) {
+            sp.step(sc, &mut sim, args.dt, 1.0);
+        }
         sim.step(args.dt);
+        stats.record(
+            &sim,
+            traffic
+                .iter()
+                .flat_map(|t| t.vehicles.iter().map(|v| (v.pos, v.active))),
+            args.dt,
+        );
     }
-    let arrived = sim.agents.len() - sim.active();
+    // 発生源の人は到着後の枠を使い回すので、延べ人数で数える
+    let total = n_initial + spawner.as_ref().map_or(0, |sp| sp.total_spawned() as usize);
+    let arrived = total - sim.active();
     eprintln!(
-        "完了: t={:.1}s, 到着 {}/{} 人, 計算 {:.2?} ({:.1}x 実時間)",
+        "完了: t={:.1}s, 到着 {}/{} 人{}, 計算 {:.2?} ({:.1}x 実時間)",
         sim.time,
         arrived,
-        sim.agents.len(),
+        total,
+        spawner.as_ref().map_or(String::new(), |sp| format!(
+            "（うち発生源から {} 人、出口で待ち {} 人）",
+            sp.total_spawned(),
+            sp.backlog()
+        )),
         t_sim.elapsed(),
         sim.time / t_sim.elapsed().as_secs_f32()
     );
-
     if let Some(ev) = &evac {
         let fmt = |t: Option<f32>| t.map_or("未完了".to_string(), |t| format!("{t:.0} 秒"));
         eprintln!(
@@ -464,18 +691,67 @@ fn main() -> Result<()> {
             eprintln!("  {}: {} 人", s.name, s.arrived);
         }
     }
-    if let Some(p) = &args.png {
-        write_heatmap(&sim, &heat, p)?;
-        eprintln!("ヒートマップ: {}", p.display());
+    Ok(RunOut {
+        sim,
+        heat,
+        stats,
+        closed,
+    })
+}
+
+/// Before/After の要約を表示する。
+fn print_compare(b: &ZoneStats, a: &ZoneStats) {
+    let sum = |s: &ZoneStats, f: &dyn Fn(&ZoneStats, usize) -> f32| -> f32 {
+        (0..s.nx * s.ny).map(|z| f(s, z)).sum()
+    };
+    let passes = |s: &ZoneStats| s.ped_passes.iter().sum::<u32>().max(1) as f32;
+    let mean_wait = |s: &ZoneStats| s.wait.iter().sum::<f64>() as f32 / passes(s);
+    let mean_dwell = |s: &ZoneStats| s.dwell.iter().sum::<f64>() as f32 / passes(s);
+    let peak = |s: &ZoneStats| {
+        (0..s.nx * s.ny)
+            .map(|z| s.peak_density(z))
+            .fold(0.0, f32::max)
+    };
+    eprintln!("比較 (Before → After):");
+    eprintln!(
+        "  区画通過（延べ, /h）: {:.0} → {:.0}",
+        sum(b, &|s, z| s.passes_per_h(z)),
+        sum(a, &|s, z| s.passes_per_h(z))
+    );
+    eprintln!(
+        "  平均待ち時間 / 区画: {:.2} s → {:.2} s",
+        mean_wait(b),
+        mean_wait(a)
+    );
+    eprintln!(
+        "  平均滞留時間 / 区画: {:.2} s → {:.2} s",
+        mean_dwell(b),
+        mean_dwell(a)
+    );
+    eprintln!("  最大密度: {:.2} → {:.2} 人/m²", peak(b), peak(a));
+    // 増えた区画の上位
+    let mut d: Vec<(usize, f32)> = (0..a.nx * a.ny)
+        .map(|z| (z, a.passes_per_h(z) - b.passes_per_h(z)))
+        .collect();
+    d.sort_by(|x, y| y.1.total_cmp(&x.1));
+    let top: Vec<String> = d
+        .iter()
+        .take(5)
+        .filter(|x| x.1 > 0.0)
+        .map(|(z, v)| format!("({},{}) +{:.0}/h", z % a.nx, z / a.nx, v))
+        .collect();
+    if !top.is_empty() {
+        eprintln!("  通過が増えた区画 (ix,iy): {}", top.join(", "));
     }
-    Ok(())
 }
 
 /// 確認用の地図（北が上）。緑=地面, 灰=歩行可能, 黒=建物, 濃灰=車道, 白=道路中心線, 赤=交差点, 青=出入口。
 /// 信号があれば 縞=横断歩道, 黄=停止線, 紫=スクランブルの交差点内。
+/// シナリオがあれば 黄黒の斜線=通行止め, 緑の円=発生源, 紫の円=行き先 も描く。
 fn write_map(
     grid: &WalkGrid,
     traffic: Option<&traffic::Traffic>,
+    sc: Option<&Scenario>,
     path: &std::path::Path,
 ) -> Result<()> {
     let net = traffic.map(|t| &t.graph);
@@ -569,6 +845,39 @@ fn write_map(
                     put(c.x + dx, c.y + dy, col);
                 }
             }
+        }
+    }
+    if let Some(sc) = sc {
+        for c in sc.closures.iter().filter(|c| c.enabled) {
+            for p in &c.polys {
+                walkmap::fill_polygon(p, grid.origin, grid.cell, w, h, |i| {
+                    let (x, y) = (i % w, i / w);
+                    let col = if (x + y) % 6 < 3 {
+                        [250, 210, 0]
+                    } else {
+                        [20, 20, 20]
+                    };
+                    put(x as i64, y as i64, col);
+                });
+            }
+        }
+        let mut disc = |c: glam::Vec2, r: f32, col: [u8; 3]| {
+            let q = (c - grid.origin) / grid.cell;
+            let rr = (r / grid.cell).max(3.0);
+            for dy in -(rr as i64)..=(rr as i64) {
+                for dx in -(rr as i64)..=(rr as i64) {
+                    let d = ((dx * dx + dy * dy) as f32).sqrt();
+                    if d <= rr && d >= rr - 2.5 {
+                        put(q.x as i64 + dx, q.y as i64 + dy, col);
+                    }
+                }
+            }
+        };
+        for s in &sc.sources {
+            disc(s.pos, s.radius, [30, 200, 60]);
+        }
+        for d in &sc.destinations {
+            disc(d.pos, d.radius, [200, 40, 220]);
         }
     }
     std::fs::write(path, png::encode_rgb(w as u32, h as u32, &img))?;

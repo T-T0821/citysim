@@ -6,6 +6,9 @@
 //! - 壁からの反発: 障害物距離場の勾配方向
 
 pub mod evacuation;
+pub mod event;
+pub mod png;
+pub mod report;
 pub mod scenario;
 
 use glam::Vec2;

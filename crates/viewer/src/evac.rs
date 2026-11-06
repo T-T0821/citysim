@@ -83,7 +83,7 @@ pub fn advance(st: &mut SimState) {
     ev.update(&st.sim);
 }
 
-/// 左下の「場所・避難」ウィンドウ。
+/// 3D 表示の右下の「場所・避難」ウィンドウ。
 pub fn tools_window(
     mut contexts: EguiContexts,
     mut state: ResMut<SimState>,
@@ -97,7 +97,8 @@ pub fn tools_window(
     };
     let ctx = ctx.clone();
     egui::Window::new("場所・避難")
-        .anchor(egui::Align2::LEFT_BOTTOM, [10.0, -10.0])
+        // 左上はシナリオのウィンドウ、右は設定パネルなので、3D 表示の右下に置く
+        .anchor(egui::Align2::RIGHT_BOTTOM, [-350.0, -10.0])
         .default_width(300.0)
         .resizable(false)
         .collapsible(true)
