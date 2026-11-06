@@ -25,6 +25,11 @@ struct Args {
     seed: u64,
     respawn: bool,
     screenshot: Option<(PathBuf, f32)>,
+    record: Option<(PathBuf, f32)>,
+    fps: f32,
+    speed: f32,
+    orbit: f32,
+    warmup: f32,
 }
 
 fn parse_args() -> Result<Args> {
@@ -32,6 +37,11 @@ fn parse_args() -> Result<Args> {
         gml: vec![],
         agents: 1000,
         vehicles: 40,
+        record: None,
+        fps: 30.0,
+        speed: 2.0,
+        orbit: 0.0,
+        warmup: 0.0,
         cell: 0.5,
         seed: 1,
         respawn: true,
@@ -65,10 +75,23 @@ fn parse_args() -> Result<Args> {
                 let t = v()?.parse()?;
                 a.screenshot = Some((p, t));
             }
+            // 動画用: 毎フレーム一定のシミュレーション時間だけ進めて連番 PNG を書き出す
+            "--record" => {
+                let p = PathBuf::from(v()?);
+                let t = v()?.parse()?;
+                a.record = Some((p, t));
+            }
+            "--fps" => a.fps = v()?.parse()?,
+            "--speed" => a.speed = v()?.parse()?,
+            // 録画中のカメラ旋回速度 [rad/s]
+            "--orbit" => a.orbit = v()?.parse()?,
+            // 録画前に進めておくシミュレーション時間 [s]
+            "--warmup" => a.warmup = v()?.parse()?,
             "-h" | "--help" => {
                 println!(
                     "usage: plateau-crowd-viewer --gml <file|dir>... [--agents N] [--vehicles N] [--cell M] [--seed N]\n\
-                     \x20                          [--no-respawn] [--screenshot out.png <sim秒>]"
+                     \x20                          [--no-respawn] [--screenshot out.png <sim秒>]\n\
+                     \x20                          [--record <dir> <動画の秒数>] [--fps 30] [--speed 2] [--orbit rad/s] [--warmup 秒]"
                 );
                 std::process::exit(0);
             }
@@ -118,6 +141,20 @@ struct HeatOverlay;
 #[derive(Component)]
 struct CarVis(usize);
 
+#[derive(Resource)]
+struct RecordPlan {
+    dir: PathBuf,
+    frames: u32,
+    idx: u32,
+    sim_per_frame: f32,
+    orbit_per_frame: f32,
+    done_at: Option<u32>,
+    warmup: f32,
+}
+
+/// 録画開始前に描画を落ち着かせるフレーム数
+const RECORD_WARMUP: u32 = 15;
+
 #[derive(Component)]
 struct Hud;
 
@@ -163,7 +200,7 @@ fn main() -> Result<()> {
         rng: Rng::new(args.seed ^ 0x9E37_79B9),
         goal_cells,
         respawn: args.respawn,
-        speed: 2.0,
+        speed: args.speed,
         paused: false,
         acc: 0.0,
         heat,
@@ -199,6 +236,19 @@ fn main() -> Result<()> {
         )
             .chain(),
     );
+    if let Some((dir, secs)) = args.record {
+        std::fs::create_dir_all(&dir)?;
+        app.insert_resource(RecordPlan {
+            dir,
+            frames: (secs * args.fps).round() as u32,
+            idx: 0,
+            sim_per_frame: args.speed / args.fps,
+            orbit_per_frame: args.orbit / args.fps,
+            done_at: None,
+            warmup: args.warmup,
+        })
+        .add_systems(Update, record_frames.after(update_hud));
+    }
     if let Some((path, at)) = args.screenshot {
         app.insert_resource(ScreenshotPlan {
             path,
@@ -507,9 +557,31 @@ fn controls(
     }
 }
 
-fn step_sim(time: Res<Time>, mut state: ResMut<SimState>, shot: Option<Res<ScreenshotPlan>>) {
+fn step_sim(
+    time: Res<Time>,
+    mut state: ResMut<SimState>,
+    shot: Option<Res<ScreenshotPlan>>,
+    rec: Option<Res<RecordPlan>>,
+    frames: Res<bevy::diagnostic::FrameCount>,
+) {
     let st = &mut *state;
     if st.paused {
+        return;
+    }
+    if let Some(r) = rec {
+        // 録画モード: 描画速度に関係なく 1 フレーム = sim_per_frame 秒
+        if frames.0 < RECORD_WARMUP || r.idx >= r.frames {
+            while st.sim.time < r.warmup {
+                advance(st);
+            }
+            return;
+        }
+        st.acc += r.sim_per_frame;
+        let n = (st.acc / DT + 1e-4) as usize;
+        st.acc -= n as f32 * DT;
+        for _ in 0..n {
+            advance(st);
+        }
         return;
     }
     // スクリーンショットモードでは描画速度に関係なく決まった時刻まで一気に進める
@@ -525,6 +597,12 @@ fn step_sim(time: Res<Time>, mut state: ResMut<SimState>, shot: Option<Res<Scree
     };
     while budget > 0 {
         budget -= 1;
+        advance(st);
+    }
+}
+
+fn advance(st: &mut SimState) {
+    {
         if let Some(t) = st.traffic.as_mut() {
             let peds: Vec<Vec2> = st
                 .sim
@@ -704,5 +782,36 @@ fn take_screenshot(
             exit.write(AppExit::Success);
         }
         _ => {}
+    }
+}
+
+fn record_frames(
+    mut commands: Commands,
+    mut plan: ResMut<RecordPlan>,
+    frames: Res<bevy::diagnostic::FrameCount>,
+    mut cams: Query<&mut camera::OrbitCamera>,
+    mut exit: EventWriter<AppExit>,
+) {
+    if frames.0 < RECORD_WARMUP {
+        return;
+    }
+    if plan.idx < plan.frames {
+        let path = plan.dir.join(format!("frame_{:05}.png", plan.idx));
+        commands
+            .spawn(Screenshot::primary_window())
+            .observe(save_to_disk(path));
+        plan.idx += 1;
+        for mut c in &mut cams {
+            c.yaw += plan.orbit_per_frame;
+        }
+        if plan.idx % 30 == 0 {
+            info!("録画 {}/{} フレーム", plan.idx, plan.frames);
+        }
+        return;
+    }
+    // 保存待ちのスクリーンショットが書き終わるまで少し待って終了
+    let done = *plan.done_at.get_or_insert(frames.0);
+    if frames.0 > done + 30 {
+        exit.write(AppExit::Success);
     }
 }

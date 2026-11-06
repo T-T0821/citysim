@@ -55,6 +55,14 @@ cargo run --release -p plateau-crowd-viewer -- --gml testdata/sample.gml --agent
 歩行者は目的地（東西南北の縁）ごとに色分けされ、車は乗用車（4.5m）とトラック（7.5m、1 割）が走ります。歩行者は到着すると別の縁から再投入されます（`--no-respawn` で無効）。
 `--screenshot out.png 60` でシミュレーション 60 秒時点の画面を保存して終了します（`PLATEAU_SHOW_HEAT=1` でヒートマップ付き、`PLATEAU_CAM="yaw,pitch,距離,x,y"` でカメラ位置指定）。
 
+動画は `--record <出力ディレクトリ> <秒数>` で連番 PNG を書き出し、ffmpeg でつなぎます（`--speed` 再生倍率、`--orbit` カメラ旋回 rad/s、`--warmup` 録画前に進める秒数）。
+
+```sh
+cargo run --release -p plateau-crowd-viewer -- --gml testdata/sample.gml --agents 700 --vehicles 30 \
+    --record rec 20 --speed 1.5 --orbit 0.04 --warmup 30
+ffmpeg -framerate 30 -i rec/frame_%05d.png -c:v libx264 -pix_fmt yuv420p sim.mp4
+```
+
 Linux では `libxkbcommon-x11-0` と Vulkan ドライバ（GPU のもの、または `mesa-vulkan-drivers`）が必要です。
 
 ![viewer](docs/viewer.png)
