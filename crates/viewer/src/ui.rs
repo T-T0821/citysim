@@ -16,6 +16,9 @@ pub struct Settings {
     pub speed_limit_kmh: f32,
     pub respawn: bool,
     pub seed: u64,
+    /// 信号機を置くか（オフなら交差点は先着順）
+    pub signals: bool,
+    pub signal: traffic::SignalConfig,
     /// 「適用」が押された
     pub apply_requested: bool,
 }
@@ -29,6 +32,8 @@ impl Settings {
             speed_limit_kmh: 47.0,
             respawn,
             seed,
+            signals: true,
+            signal: traffic::SignalConfig::default(),
             apply_requested: false,
         }
     }
@@ -123,6 +128,8 @@ pub fn settings_panel(
                 ui.checkbox(&mut settings.respawn, "");
                 ui.end_row();
             });
+            ui.add_space(4.0);
+            signal_settings(ui, &mut settings);
             ui.add_space(6.0);
             if ui
                 .add_sized([ui.available_width(), 28.0], egui::Button::new("適用して最初から"))
@@ -130,7 +137,7 @@ pub fn settings_panel(
             {
                 settings.apply_requested = true;
             }
-            ui.small("人数・台数・速度・シードは「適用」で作り直したときに反映されます。");
+            ui.small("人数・台数・速度・シード・信号は「適用」で作り直したときに反映されます。");
 
             ui.separator();
             ui.heading("再生");
@@ -175,6 +182,12 @@ pub fn settings_panel(
                 let v: f32 = state.sim.agents.iter().filter(|a| !a.arrived).map(|a| a.vel.length()).sum::<f32>() / n;
                 ui.label(format!("{v:.2} m/s"));
                 ui.end_row();
+                if let Some(s) = state.traffic.as_ref().and_then(|t| t.signals.as_ref()) {
+                    ui.label("信号のある交差点");
+                    let scr = s.intersections.iter().filter(|i| i.plan == traffic::signal::Plan::Scramble).count();
+                    ui.label(format!("{} か所（スクランブル {}）", s.intersections.len(), scr));
+                    ui.end_row();
+                }
                 if let Some(t) = &state.traffic {
                     ui.label("車の平均速度");
                     let n = t.active().max(1) as f32;
@@ -196,4 +209,81 @@ pub fn settings_panel(
         );
     }
     capture.0 = ctx.wants_pointer_input() || ctx.is_pointer_over_area();
+}
+
+/// 信号機の設定欄。
+fn signal_settings(ui: &mut egui::Ui, settings: &mut Settings) {
+    egui::CollapsingHeader::new("信号機")
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.checkbox(
+                &mut settings.signals,
+                "信号機を置く（オフ: 交差点は先着順）",
+            );
+            ui.add_enabled_ui(settings.signals, |ui| {
+                let c = &mut settings.signal;
+                egui::ComboBox::from_label("歩行者の方式")
+                    .selected_text(c.mode.label())
+                    .show_ui(ui, |ui| {
+                        for m in traffic::PedMode::ALL {
+                            ui.selectable_value(&mut c.mode, m, m.label());
+                        }
+                    });
+                egui::Grid::new("signal")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("サイクル長");
+                        ui.add(egui::Slider::new(&mut c.cycle, 40.0..=180.0).suffix(" s"));
+                        ui.end_row();
+                        ui.label("主道路の青の割合");
+                        ui.add(egui::Slider::new(&mut c.main_split, 0.2..=0.8));
+                        ui.end_row();
+                        ui.label("歩行者専用の青");
+                        ui.add(egui::Slider::new(&mut c.ped_green, 5.0..=60.0).suffix(" s"));
+                        ui.end_row();
+                        ui.label("歩行者の青点滅");
+                        ui.add(egui::Slider::new(&mut c.ped_flash, 0.0..=15.0).suffix(" s"));
+                        ui.end_row();
+                        ui.label("黄 / 全赤");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut c.yellow)
+                                    .range(1.0..=6.0)
+                                    .speed(0.1)
+                                    .suffix(" s"),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut c.all_red)
+                                    .range(0.0..=6.0)
+                                    .speed(0.1)
+                                    .suffix(" s"),
+                            );
+                        });
+                        ui.end_row();
+                    });
+                // 実際の青時間（サイクル長から黄・全赤・歩行者専用現示を引いて主従に配分）
+                let show = |plan| {
+                    let t = traffic::signal::Timing::new(c, plan);
+                    format!("主 {:.0} s / 従 {:.0} s", t.green[0], t.green[1])
+                };
+                let (std, excl) = (
+                    show(traffic::signal::Plan::Concurrent),
+                    show(traffic::signal::Plan::Exclusive),
+                );
+                let text = match c.mode {
+                    traffic::PedMode::Concurrent => format!("車の青: {std}"),
+                    traffic::PedMode::Exclusive | traffic::PedMode::Scramble => {
+                        format!(
+                            "車の青: {excl}（歩行者専用 {:.0} s）",
+                            c.ped_green + c.ped_flash
+                        )
+                    }
+                    traffic::PedMode::Auto => {
+                        format!("車の青: 標準 {std}\nスクランブル {excl}")
+                    }
+                };
+                ui.small(text);
+            });
+        });
 }
