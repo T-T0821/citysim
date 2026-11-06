@@ -3,13 +3,16 @@
 //! - 道路網: 車道の中心線グラフ（[`graph::RoadGraph`]）。各エッジは双方向で、左側通行。
 //! - 縦方向: Intelligent Driver Model (Treiber et al. 2000) で前方車・停止線・歩行者に追従
 //! - 交差点: 進入方向ごとの排他ロック（同じ方向からの車列はまとめて通す、一定時間で交代）
+//! - 信号機（任意, [`signal`]）: 赤・黄では停止線で止まり、青の間だけ上の通行権で交差点に入る
 //! - 出入口: 範囲の縁の端点から流入し、縁に着いたら別の出入口から再投入
 
 mod closure;
 pub mod graph;
+pub mod signal;
 
 use glam::Vec2;
 pub use graph::RoadGraph;
+pub use signal::{Light, PedMode, SignalConfig, Signals, Walk};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -104,6 +107,8 @@ pub struct Traffic {
     locks: Vec<JunctionLock>,
     rng: u64,
     entries: Vec<Lane>,
+    /// 信号機（None なら先着順の通行権だけで制御）
+    pub signals: Option<Signals>,
 }
 
 impl Traffic {
@@ -134,6 +139,7 @@ impl Traffic {
             locks,
             rng: seed.max(1),
             entries,
+            signals: None,
         };
         // 初期配置: 道路網全体に間隔をあけてばらまく
         let lanes: Vec<Lane> = (0..t.graph.edges.len())
@@ -168,6 +174,11 @@ impl Traffic {
             t.vehicles.push(v);
         }
         t
+    }
+
+    /// 信号機を設定する（None で信号なし）。
+    pub fn set_signals(&mut self, signals: Option<Signals>) {
+        self.signals = signals;
     }
 
     pub fn active(&self) -> usize {
@@ -348,8 +359,27 @@ impl Traffic {
             let mut v0 = v.v0;
             let holds = matches!(v.lock, Some((n, _)) if n == end);
             if let (false, false, Some(next)) = (node.border, holds, v.next) {
-                let stop = remaining - node.radius - 0.5 * v.length;
-                if stop < 25.0 {
+                // 信号のある流入路なら停止線は横断歩道の手前
+                let sig = self
+                    .signals
+                    .as_ref()
+                    .and_then(|s| s.light_for(v.lane, self.time));
+                let stop = remaining - sig.map_or(node.radius, |s| s.1) - 0.5 * v.length;
+                // 赤は止まりきれる限り止まる。黄は無理なく止まれるときだけ止まる（ジレンマ回避）
+                let halt = match sig {
+                    Some((Light::Red, _)) => stop > -1.0 && stop >= v.v * v.v / 12.0 - 1.0,
+                    Some((Light::Yellow, _)) => {
+                        stop > 0.0 && stop >= v.v * v.v / (2.0 * 1.6 * p.b_comf)
+                    }
+                    _ => false,
+                };
+                if halt {
+                    if stop.max(0.0) < gap {
+                        gap = stop.max(0.0);
+                        v_lead = 0.0;
+                    }
+                    self.vehicles[i].junction_wait = 0.0;
+                } else if stop < 25.0 {
                     let mv = Movement {
                         from: v.lane,
                         to: next,

@@ -12,7 +12,9 @@ use crate::SimState;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts};
-use crowd::event::{format_clock, parse_clock, Closure, Destination, Scenario, ScenarioFile, Source, Spawner};
+use crowd::event::{
+    format_clock, parse_clock, Closure, Destination, Scenario, ScenarioFile, Source, Spawner,
+};
 use crowd::report::ZoneStats;
 use walkmap::closure::line_polygons;
 use walkmap::{ClosureKind, WalkGrid};
@@ -74,7 +76,9 @@ impl ScenarioState {
             goal_names: vec![],
             zone_size,
             diff_view: false,
-            path: path.map(|p| p.display().to_string()).unwrap_or_else(|| "scenario.toml".into()),
+            path: path
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "scenario.toml".into()),
             export_dir: "citysim-export".into(),
             message: String::new(),
             place: PlaceMode::None,
@@ -121,7 +125,11 @@ impl ScenarioState {
 
 /// 差分ヒートマップの RGBA（テクスチャの上端 = 北）
 pub fn diff_pixels(st: &ScenarioState, g: &WalkGrid, data: &mut [u8]) {
-    let Some(before) = st.before.as_ref().filter(|b| b.heat.len() == st.stats.heat.len()) else {
+    let Some(before) = st
+        .before
+        .as_ref()
+        .filter(|b| b.heat.len() == st.stats.heat.len())
+    else {
         data.iter_mut().for_each(|v| *v = 0);
         return;
     };
@@ -129,7 +137,11 @@ pub fn diff_pixels(st: &ScenarioState, g: &WalkGrid, data: &mut [u8]) {
     let diff: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x - y).collect();
     let mut abs: Vec<f32> = diff.iter().map(|d| d.abs()).filter(|d| *d > 0.0).collect();
     abs.sort_by(|x, y| x.total_cmp(y));
-    let scale = abs.get(abs.len() * 98 / 100).copied().unwrap_or(1.0).max(1e-6);
+    let scale = abs
+        .get(abs.len() * 98 / 100)
+        .copied()
+        .unwrap_or(1.0)
+        .max(1e-6);
     for y in 0..g.h {
         for x in 0..g.w {
             let i = g.idx(x, y);
@@ -143,9 +155,19 @@ pub fn diff_pixels(st: &ScenarioState, g: &WalkGrid, data: &mut [u8]) {
                 let k = d.abs().sqrt();
                 let al = (80.0 + 170.0 * k) as u8;
                 if d > 0.0 {
-                    [230, (200.0 * (1.0 - k)) as u8, (200.0 * (1.0 - k)) as u8, al]
+                    [
+                        230,
+                        (200.0 * (1.0 - k)) as u8,
+                        (200.0 * (1.0 - k)) as u8,
+                        al,
+                    ]
                 } else {
-                    [(200.0 * (1.0 - k)) as u8, (120.0 + 80.0 * (1.0 - k)) as u8, 240, al]
+                    [
+                        (200.0 * (1.0 - k)) as u8,
+                        (120.0 + 80.0 * (1.0 - k)) as u8,
+                        240,
+                        al,
+                    ]
                 }
             };
             data[o..o + 4].copy_from_slice(&px);
@@ -203,7 +225,11 @@ pub fn sync_markers(
         commands.spawn((
             ScenarioMarker,
             Mesh3d(meshes.add(Cylinder::new(s.radius, 0.25))),
-            MeshMaterial3d(if s.enabled { src.clone() } else { src_off.clone() }),
+            MeshMaterial3d(if s.enabled {
+                src.clone()
+            } else {
+                src_off.clone()
+            }),
             Transform::from_translation(to_world(s.pos, 0.15)),
         ));
     }
@@ -234,14 +260,18 @@ pub fn place_on_map(
     let over_ui = contexts
         .try_ctx_mut()
         .is_some_and(|c| c.wants_pointer_input() || c.is_pointer_over_area());
-    let Some(p) = cursor_ground(&windows, &cams) else { return };
+    let Some(p) = cursor_ground(&windows, &cams) else {
+        return;
+    };
     if buttons.just_pressed(MouseButton::Left) && !over_ui {
         scen.drag_start = Some(p);
     }
     if !buttons.just_released(MouseButton::Left) {
         return;
     }
-    let Some(a) = scen.drag_start.take() else { return };
+    let Some(a) = scen.drag_start.take() else {
+        return;
+    };
     let t = state.sim.time;
     let scen = &mut *scen;
     let sc = &mut scen.scenario;
@@ -272,7 +302,12 @@ pub fn place_on_map(
                 name: format!("発生源{n}"),
                 pos: p,
                 radius: 4.0,
-                rate: vec![(t0, 0.0), (t0 + 60.0, 60.0), (t0 + 600.0, 60.0), (t0 + 660.0, 0.0)],
+                rate: vec![
+                    (t0, 0.0),
+                    (t0 + 60.0, 60.0),
+                    (t0 + 600.0, 60.0),
+                    (t0 + 660.0, 0.0),
+                ],
                 to: vec![],
                 speed: None,
                 enabled: true,
@@ -382,14 +417,25 @@ pub fn scenario_panel(
             });
             ui.horizontal(|ui| {
                 ui.label("開始時刻");
-                let mut s = scen.scenario.start_clock.map(|c| format_clock(c)[..5].to_string()).unwrap_or_default();
+                let mut s = scen
+                    .scenario
+                    .start_clock
+                    .map(|c| format_clock(c)[..5].to_string())
+                    .unwrap_or_default();
                 if ui
-                    .add(egui::TextEdit::singleline(&mut s).desired_width(60.0).hint_text("HH:MM"))
+                    .add(
+                        egui::TextEdit::singleline(&mut s)
+                            .desired_width(60.0)
+                            .hint_text("HH:MM"),
+                    )
                     .changed()
                 {
                     scen.scenario.start_clock = parse_clock(&s).ok();
                 }
-                ui.label(format!("現在 {}", scen.scenario.clock_label(state.sim.time)));
+                ui.label(format!(
+                    "現在 {}",
+                    scen.scenario.clock_label(state.sim.time)
+                ));
             });
 
             // ---- 発生源
@@ -414,7 +460,11 @@ pub fn scenario_panel(
             });
             let goal_names = scen.goal_names.clone();
             let start = scen.scenario.start_clock;
-            let spawned = scen.spawner.as_ref().map(|s| s.spawned()).unwrap_or_default();
+            let spawned = scen
+                .spawner
+                .as_ref()
+                .map(|s| s.spawned())
+                .unwrap_or_default();
             let mut remove = None;
             let mut changed = false;
             for (i, s) in scen.scenario.sources.iter_mut().enumerate() {
@@ -425,73 +475,104 @@ pub fn scenario_panel(
                     s.rate_at(t),
                     spawned.get(i).copied().unwrap_or(0)
                 );
-                egui::CollapsingHeader::new(title).id_salt(("src", i)).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        changed |= ui.checkbox(&mut s.enabled, "有効").changed();
-                        ui.text_edit_singleline(&mut s.name);
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("半径");
-                        changed |= ui.add(egui::DragValue::new(&mut s.radius).range(0.5..=50.0).suffix(" m")).changed();
-                        ui.label("歩行速度");
-                        let mut v = s.speed.unwrap_or(1.34);
-                        if ui.add(egui::DragValue::new(&mut v).range(0.3..=2.5).speed(0.01).suffix(" m/s")).changed() {
-                            s.speed = Some(v);
-                            changed = true;
-                        }
-                    });
-                    ui.label("時刻ごとの発生人数（間は直線でつなぐ）");
-                    let mut del = None;
-                    egui::Grid::new(("rate", i)).num_columns(4).show(ui, |ui| {
-                        for (k, (tt, r)) in s.rate.iter_mut().enumerate() {
-                            changed |= ui.add(egui::DragValue::new(tt).range(0.0..=86400.0).speed(5.0).suffix(" s")).changed();
-                            ui.label(match start {
-                                Some(c) => format_clock(c + *tt),
-                                None => String::new(),
-                            });
-                            changed |= ui.add(egui::DragValue::new(r).range(0.0..=2000.0).suffix(" 人/分")).changed();
-                            if ui.small_button("×").clicked() {
-                                del = Some(k);
-                            }
-                            ui.end_row();
-                        }
-                    });
-                    if let Some(k) = del {
-                        s.rate.remove(k);
-                        changed = true;
-                    }
-                    if ui.small_button("＋ 点を追加").clicked() {
-                        let last = s.rate.last().copied().unwrap_or((t, 30.0));
-                        s.rate.push((last.0 + 300.0, last.1));
-                        changed = true;
-                    }
-                    s.rate.sort_by(|a, b| a.0.total_cmp(&b.0));
-                    ui.label("行き先（未選択なら全部から等確率）");
-                    ui.horizontal_wrapped(|ui| {
-                        for g in &goal_names {
-                            let pos = s.to.iter().position(|(n, _)| n == g);
-                            let mut on = pos.is_some();
-                            if ui.checkbox(&mut on, g).changed() {
-                                match pos {
-                                    Some(p) => {
-                                        s.to.remove(p);
-                                    }
-                                    None => s.to.push((g.clone(), 1.0)),
-                                }
+                egui::CollapsingHeader::new(title)
+                    .id_salt(("src", i))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            changed |= ui.checkbox(&mut s.enabled, "有効").changed();
+                            ui.text_edit_singleline(&mut s.name);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("半径");
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut s.radius)
+                                        .range(0.5..=50.0)
+                                        .suffix(" m"),
+                                )
+                                .changed();
+                            ui.label("歩行速度");
+                            let mut v = s.speed.unwrap_or(1.34);
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut v)
+                                        .range(0.3..=2.5)
+                                        .speed(0.01)
+                                        .suffix(" m/s"),
+                                )
+                                .changed()
+                            {
+                                s.speed = Some(v);
                                 changed = true;
                             }
+                        });
+                        ui.label("時刻ごとの発生人数（間は直線でつなぐ）");
+                        let mut del = None;
+                        egui::Grid::new(("rate", i)).num_columns(4).show(ui, |ui| {
+                            for (k, (tt, r)) in s.rate.iter_mut().enumerate() {
+                                changed |= ui
+                                    .add(
+                                        egui::DragValue::new(tt)
+                                            .range(0.0..=86400.0)
+                                            .speed(5.0)
+                                            .suffix(" s"),
+                                    )
+                                    .changed();
+                                ui.label(match start {
+                                    Some(c) => format_clock(c + *tt),
+                                    None => String::new(),
+                                });
+                                changed |= ui
+                                    .add(
+                                        egui::DragValue::new(r)
+                                            .range(0.0..=2000.0)
+                                            .suffix(" 人/分"),
+                                    )
+                                    .changed();
+                                if ui.small_button("×").clicked() {
+                                    del = Some(k);
+                                }
+                                ui.end_row();
+                            }
+                        });
+                        if let Some(k) = del {
+                            s.rate.remove(k);
+                            changed = true;
+                        }
+                        if ui.small_button("＋ 点を追加").clicked() {
+                            let last = s.rate.last().copied().unwrap_or((t, 30.0));
+                            s.rate.push((last.0 + 300.0, last.1));
+                            changed = true;
+                        }
+                        s.rate.sort_by(|a, b| a.0.total_cmp(&b.0));
+                        ui.label("行き先（未選択なら全部から等確率）");
+                        ui.horizontal_wrapped(|ui| {
+                            for g in &goal_names {
+                                let pos = s.to.iter().position(|(n, _)| n == g);
+                                let mut on = pos.is_some();
+                                if ui.checkbox(&mut on, g).changed() {
+                                    match pos {
+                                        Some(p) => {
+                                            s.to.remove(p);
+                                        }
+                                        None => s.to.push((g.clone(), 1.0)),
+                                    }
+                                    changed = true;
+                                }
+                            }
+                        });
+                        for (n, w) in s.to.iter_mut() {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("  {n} の重み"));
+                                changed |= ui
+                                    .add(egui::DragValue::new(w).range(0.0..=100.0).speed(0.1))
+                                    .changed();
+                            });
+                        }
+                        if ui.button("この発生源を削除").clicked() {
+                            remove = Some(i);
                         }
                     });
-                    for (n, w) in s.to.iter_mut() {
-                        ui.horizontal(|ui| {
-                            ui.label(format!("  {n} の重み"));
-                            changed |= ui.add(egui::DragValue::new(w).range(0.0..=100.0).speed(0.1)).changed();
-                        });
-                    }
-                    if ui.button("この発生源を削除").clicked() {
-                        remove = Some(i);
-                    }
-                });
             }
             if let Some(i) = remove {
                 scen.scenario.sources.remove(i);
@@ -505,9 +586,17 @@ pub fn scenario_panel(
             let mut remove = None;
             for (i, d) in scen.scenario.destinations.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
-                    changed |= ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(120.0)).changed();
+                    changed |= ui
+                        .add(egui::TextEdit::singleline(&mut d.name).desired_width(120.0))
+                        .changed();
                     ui.label("半径");
-                    changed |= ui.add(egui::DragValue::new(&mut d.radius).range(1.0..=50.0).suffix(" m")).changed();
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut d.radius)
+                                .range(1.0..=50.0)
+                                .suffix(" m"),
+                        )
+                        .changed();
                     if ui.small_button("×").clicked() {
                         remove = Some(i);
                     }
@@ -522,7 +611,9 @@ pub fn scenario_panel(
             ui.separator();
             ui.horizontal(|ui| {
                 ui.strong("通行止め・工事");
-                changed |= ui.checkbox(&mut scen.scenario.closures_on, "有効にする").changed();
+                changed |= ui
+                    .checkbox(&mut scen.scenario.closures_on, "有効にする")
+                    .changed();
             });
             let mut remove = None;
             for (i, c) in scen.scenario.closures.iter_mut().enumerate() {
@@ -566,7 +657,11 @@ pub fn scenario_panel(
                         });
                     ui.selectable_value(&mut scen.place_shape, ClosureShape::Line, "線");
                     ui.selectable_value(&mut scen.place_shape, ClosureShape::Rect, "長方形");
-                    ui.add(egui::DragValue::new(&mut scen.place_width).range(1.0..=60.0).suffix(" m"));
+                    ui.add(
+                        egui::DragValue::new(&mut scen.place_width)
+                            .range(1.0..=60.0)
+                            .suffix(" m"),
+                    );
                 });
                 ui.small("道路を横切るように左ドラッグ（クリックだけなら正方形）");
             } else if scen.place != PlaceMode::None {
@@ -577,8 +672,15 @@ pub fn scenario_panel(
                 scen.pending = true;
             }
             ui.add_space(4.0);
-            let label = if scen.pending { "適用して最初から（未反映の変更あり）" } else { "適用して最初から" };
-            if ui.add_sized([ui.available_width(), 26.0], egui::Button::new(label)).clicked() {
+            let label = if scen.pending {
+                "適用して最初から（未反映の変更あり）"
+            } else {
+                "適用して最初から"
+            };
+            if ui
+                .add_sized([ui.available_width(), 26.0], egui::Button::new(label))
+                .clicked()
+            {
                 apply = true;
             }
 
@@ -588,7 +690,8 @@ pub fn scenario_panel(
             ui.horizontal(|ui| {
                 if ui.button("いまの結果を Before に").clicked() {
                     scen.before = Some(scen.stats.clone());
-                    scen.message = format!("Before を保存しました（{:.0} 秒分）", scen.stats.elapsed);
+                    scen.message =
+                        format!("Before を保存しました（{:.0} 秒分）", scen.stats.elapsed);
                 }
                 if scen.before.is_some() && ui.button("Before を消す").clicked() {
                     scen.before = None;
@@ -600,7 +703,11 @@ pub fn scenario_panel(
                     "Before: {:.0} 秒分 / After: {:.0} 秒分（どちらも 1 秒あたりに直して比べます）",
                     b.elapsed, scen.stats.elapsed
                 ));
-                if ui.checkbox(&mut scen.diff_view, "差分ヒートマップ（赤=増, 青=減）").changed() && scen.diff_view {
+                if ui
+                    .checkbox(&mut scen.diff_view, "差分ヒートマップ（赤=増, 青=減）")
+                    .changed()
+                    && scen.diff_view
+                {
                     for mut v in &mut overlay {
                         *v = Visibility::Visible;
                     }
@@ -614,7 +721,10 @@ pub fn scenario_panel(
             ui.strong("結果のエクスポート");
             ui.horizontal(|ui| {
                 ui.label("集計区画");
-                if ui.add(egui::Slider::new(&mut scen.zone_size, 5.0..=100.0).suffix(" m")).changed() {
+                if ui
+                    .add(egui::Slider::new(&mut scen.zone_size, 5.0..=100.0).suffix(" m"))
+                    .changed()
+                {
                     scen.pending = true;
                 }
             });
@@ -643,13 +753,24 @@ fn export(scen: &ScenarioState, state: &SimState) -> String {
     let sc = &scen.scenario;
     let res = scen
         .stats
-        .export_dir(&state.sim.grid, &dir, scen.before.as_ref(), &scen.closed, |t| sc.clock_label(t))
+        .export_dir(
+            &state.sim.grid,
+            &dir,
+            scen.before.as_ref(),
+            &scen.closed,
+            |t| sc.clock_label(t),
+        )
         .and_then(|mut files| {
             if let Some(b) = &scen.before {
-                b.export_dir(&state.sim.grid, &dir.join("before"), None, &[], |t| sc.clock_label(t))?;
+                b.export_dir(&state.sim.grid, &dir.join("before"), None, &[], |t| {
+                    sc.clock_label(t)
+                })?;
                 files.push("before/".into());
             }
-            std::fs::write(dir.join("scenario.toml"), sc.to_file(&scen.base_grid.projection).to_toml())?;
+            std::fs::write(
+                dir.join("scenario.toml"),
+                sc.to_file(&scen.base_grid.projection).to_toml(),
+            )?;
             files.push("scenario.toml".into());
             Ok(files)
         });

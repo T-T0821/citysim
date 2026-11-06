@@ -6,6 +6,7 @@
 mod camera;
 mod geometry;
 mod scenario;
+mod signals;
 mod ui;
 
 use anyhow::{bail, Context, Result};
@@ -40,6 +41,8 @@ struct Args {
     scenario: Option<PathBuf>,
     agents_given: bool,
     vehicles_given: bool,
+    /// 信号機（None = 信号なし）
+    signals: Option<traffic::SignalConfig>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -59,6 +62,7 @@ fn parse_args() -> Result<Args> {
         scenario: None,
         agents_given: false,
         vehicles_given: false,
+        signals: Some(traffic::SignalConfig::default()),
         cell: 0.5,
         seed: 1,
         respawn: true,
@@ -142,12 +146,34 @@ fn parse_args() -> Result<Args> {
             "--ui-font" => a.ui_font = Some(v()?.into()),
             // イベント・混雑シナリオ／通行止めの設定ファイル（TOML, scenarios/ を参照）
             "--scenario" => a.scenario = Some(v()?.into()),
+            // 信号機: auto（既定）| concurrent | exclusive | scramble | off
+            "--signals" => {
+                let m = v()?;
+                a.signals = if m == "off" {
+                    None
+                } else {
+                    let mode = traffic::PedMode::parse(&m).with_context(|| {
+                        format!("--signals は auto|concurrent|exclusive|scramble|off: {m}")
+                    })?;
+                    Some(traffic::SignalConfig {
+                        mode,
+                        ..a.signals.unwrap_or_default()
+                    })
+                };
+            }
+            "--cycle" => {
+                let x = v()?.parse()?;
+                if let Some(c) = a.signals.as_mut() {
+                    c.cycle = x;
+                }
+            }
             "-h" | "--help" => {
                 println!(
                     "usage: plateau-crowd-viewer (--gml <file|dir> | --obj <file|dir> --obj-origin 緯度,経度)... [--crop 緯度,経度,半径m] [--agents N] [--vehicles N] [--cell M] [--seed N]\n\
                      \x20                          [--no-respawn] [--screenshot out.png <sim秒>]\n\
                      \x20                          [--record <dir> <動画の秒数>] [--fps 30] [--speed 2] [--orbit rad/s] [--warmup 秒] [--ui-font font.ttf]\n\
-                     \x20                          [--scenario scenario.toml]"
+                     \x20                          [--scenario scenario.toml]\n\
+                     \x20                          [--signals auto|concurrent|exclusive|scramble|off] [--cycle S]"
                 );
                 std::process::exit(0);
             }
@@ -222,8 +248,8 @@ fn build_sim(
     scen: &mut scenario::ScenarioState,
 ) -> Result<(Simulation, Option<Traffic>, Vec<Vec<(usize, usize)>>)> {
     let grid = scen.closed_grid();
-    let traffic = match road_graph {
-        Some(net) if st.vehicles > 0 => {
+    let mut traffic = match road_graph {
+        Some(net) if st.vehicles > 0 || st.signals => {
             let params = traffic::Params {
                 speed_limit: st.speed_limit_kmh / 3.6,
                 ..Default::default()
@@ -238,6 +264,16 @@ fn build_sim(
     let k = st.walk_speed / 1.34;
     for a in sim.agents.iter_mut() {
         a.desired_speed = (a.desired_speed * k).clamp(0.3, 3.0);
+    }
+    // 信号機: 横断歩道を通るよう歩行者の経路を引き直し、赤の横断歩道は閉じる
+    if let (Some(t), true) = (traffic.as_mut(), st.signals) {
+        let s = traffic::Signals::build(&t.graph, &sim.grid, st.signal.clone());
+        info!("信号: {} か所", s.intersections.len());
+        s.apply_walk_costs(&mut sim.grid);
+        sim.recompute_flows();
+        sim.closed = vec![false; sim.grid.w * sim.grid.h];
+        s.write_closed(t.time, &mut sim.closed);
+        t.set_signals(Some(s));
     }
     // 再投入に使うのは範囲の縁（シナリオの行き先を足す前）
     let goal_cells = sim
@@ -338,6 +374,10 @@ fn main() -> Result<()> {
         }
         None => crowd::event::Scenario::empty(),
     };
+    settings.signals = args.signals.is_some();
+    if let Some(c) = &args.signals {
+        settings.signal = c.clone();
+    }
     let mut scen = scenario::ScenarioState::new(grid, sc, args.scenario.as_deref());
     let (sim, traffic, goal_cells) = build_sim(road_graph.as_ref(), &settings, &mut scen)?;
     info!(
@@ -399,6 +439,7 @@ fn main() -> Result<()> {
             scenario::sync_markers,
             sync_agents,
             sync_cars,
+            signals::sync,
             update_heat,
             update_hud,
         )
@@ -605,6 +646,9 @@ fn setup(
         glass,
     };
     spawn_entities(&mut commands, &mut meshes, &visuals, &state);
+    let signal_mats = signals::SignalMats::new(&mut meshes, &mut materials);
+    signals::spawn(&mut commands, &mut meshes, &signal_mats, &state);
+    commands.insert_resource(signal_mats);
 
     // 光源とカメラ
     commands.spawn((
@@ -739,8 +783,10 @@ fn apply_settings(
     mut state: ResMut<SimState>,
     mut scen: ResMut<scenario::ScenarioState>,
     visuals: Res<Visuals>,
+    signal_mats: Res<signals::SignalMats>,
     agents: Query<Entity, With<AgentVis>>,
     cars: Query<Entity, With<CarVis>>,
+    signal_ents: Query<Entity, With<signals::SignalEntity>>,
 ) {
     if !settings.apply_requested {
         return;
@@ -764,10 +810,11 @@ fn apply_settings(
     st.acc = 0.0;
     st.heat.iter_mut().for_each(|h| *h = 0);
     st.heat_dirty = true;
-    for e in agents.iter().chain(cars.iter()) {
+    for e in agents.iter().chain(cars.iter()).chain(signal_ents.iter()) {
         commands.entity(e).despawn();
     }
     spawn_entities(&mut commands, &mut meshes, &visuals, st);
+    signals::spawn(&mut commands, &mut meshes, &signal_mats, st);
     info!(
         "作り直し: 歩行者 {} 人, 車 {} 台",
         st.sim.agents.len(),
@@ -875,6 +922,9 @@ fn advance(st: &mut SimState, scen: &mut scenario::ScenarioState, speed_scale: f
                 .collect();
             t.step(DT, &peds);
             st.sim.obstacles = t.obstacles();
+            if let Some(s) = &t.signals {
+                s.write_closed(t.time, &mut st.sim.closed);
+            }
         }
         scen.before_step(&mut st.sim, DT, speed_scale);
         st.sim.step(DT);
@@ -944,7 +994,11 @@ fn spawn_new_agents(
             Mesh3d(visuals.body.clone()),
             MeshMaterial3d(visuals.goal_materials[a.goal % visuals.goal_materials.len()].clone()),
             Transform::from_translation(to_world(a.pos, 0.82)),
-            if a.arrived { Visibility::Hidden } else { Visibility::Inherited },
+            if a.arrived {
+                Visibility::Hidden
+            } else {
+                Visibility::Inherited
+            },
         ));
     }
 }

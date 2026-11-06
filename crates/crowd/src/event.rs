@@ -373,11 +373,19 @@ impl Scenario {
             if polys.is_empty() {
                 return Err(format!(
                     "closure {} に polygon / rect / line のどれかが必要です",
-                    if c.name.is_empty() { format!("#{}", i + 1) } else { c.name.clone() }
+                    if c.name.is_empty() {
+                        format!("#{}", i + 1)
+                    } else {
+                        c.name.clone()
+                    }
                 ));
             }
             closures.push(Closure {
-                name: if c.name.is_empty() { format!("通行止め{}", i + 1) } else { c.name.clone() },
+                name: if c.name.is_empty() {
+                    format!("通行止め{}", i + 1)
+                } else {
+                    c.name.clone()
+                },
                 kind,
                 polys,
                 enabled: c.enabled,
@@ -386,7 +394,12 @@ impl Scenario {
         Ok(Self {
             name: f.scenario.name.clone(),
             start_clock,
-            duration: f.scenario.duration.as_ref().map(|d| d.secs(start_clock)).transpose()?,
+            duration: f
+                .scenario
+                .duration
+                .as_ref()
+                .map(|d| d.secs(start_clock))
+                .transpose()?,
             background_agents: f.scenario.background_agents,
             vehicles: f.scenario.vehicles,
             zone_size: f.scenario.zone_size,
@@ -450,7 +463,11 @@ impl Scenario {
                 .iter()
                 .flat_map(|c| {
                     c.polys.iter().enumerate().map(move |(i, p)| ClosureSpec {
-                        name: if c.polys.len() > 1 { format!("{}-{}", c.name, i + 1) } else { c.name.clone() },
+                        name: if c.polys.len() > 1 {
+                            format!("{}-{}", c.name, i + 1)
+                        } else {
+                            c.name.clone()
+                        },
                         kind: c.kind.key().into(),
                         polygon: Some(p.iter().map(|&q| geo(q)).collect()),
                         enabled: c.enabled,
@@ -597,7 +614,9 @@ fn cells_near(g: &WalkGrid, c: Vec2, r: f32) -> Vec<(usize, usize)> {
 
 fn cells_near_any(g: &WalkGrid, c: Vec2, r: f32) -> Vec<(usize, usize)> {
     let near = |r: f32| -> Vec<(usize, usize)> {
-        let lo = ((c - Vec2::splat(r) - g.origin) / g.cell).floor().max(Vec2::ZERO);
+        let lo = ((c - Vec2::splat(r) - g.origin) / g.cell)
+            .floor()
+            .max(Vec2::ZERO);
         let hi = (c + Vec2::splat(r) - g.origin) / g.cell;
         let mut v = vec![];
         for y in lo.y as usize..=(hi.y.max(0.0) as usize).min(g.h.saturating_sub(1)) {
@@ -614,10 +633,11 @@ fn cells_near_any(g: &WalkGrid, c: Vec2, r: f32) -> Vec<(usize, usize)> {
         return v;
     }
     let all = near(30.0);
-    let Some(&best) = all
-        .iter()
-        .min_by(|a, b| g.center(a.0, a.1).distance(c).total_cmp(&g.center(b.0, b.1).distance(c)))
-    else {
+    let Some(&best) = all.iter().min_by(|a, b| {
+        g.center(a.0, a.1)
+            .distance(c)
+            .total_cmp(&g.center(b.0, b.1).distance(c))
+    }) else {
         return vec![];
     };
     let p = g.center(best.0, best.1);
@@ -652,14 +672,19 @@ impl Spawner {
     }
     /// 混雑で出られずに待っている人数
     pub fn backlog(&self) -> u32 {
-        self.sources.iter().map(|s| s.acc.floor().max(0.0) as u32).sum()
+        self.sources
+            .iter()
+            .map(|s| s.acc.floor().max(0.0) as u32)
+            .sum()
     }
 
     /// `sim.time` から dt 秒ぶんの発生を行う。`speed_scale` は歩行速度の倍率。
     pub fn step(&mut self, sc: &Scenario, sim: &mut Simulation, dt: f32, speed_scale: f32) {
         let t = sim.time;
         for (si, src) in sc.sources.iter().enumerate() {
-            let Some(rt) = self.sources.get_mut(si) else { break };
+            let Some(rt) = self.sources.get_mut(si) else {
+                break;
+            };
             if !src.enabled || rt.targets.is_empty() {
                 continue;
             }
@@ -670,7 +695,8 @@ impl Spawner {
                 tries += 1;
                 let (cx, cy) = rt.cells[(self.rng.next_u64() % rt.cells.len() as u64) as usize];
                 let pos = sim.grid.center(cx, cy)
-                    + Vec2::new(self.rng.range(-0.4, 0.4), self.rng.range(-0.4, 0.4)) * sim.grid.cell;
+                    + Vec2::new(self.rng.range(-0.4, 0.4), self.rng.range(-0.4, 0.4))
+                        * sim.grid.cell;
                 if !sim.grid.is_walkable(pos)
                     || sim
                         .agents
@@ -757,7 +783,11 @@ rect = [[90.0, 60.0], [110.0, 80.0]]
         assert_eq!(sc.sources[0].rate[1], (60.0, 120.0));
         assert_eq!(sc.start_clock, Some(17.0 * 3600.0));
         assert!((sc.sources[0].total_until(1e9) - 120.0).abs() < 1e-3);
-        let back = Scenario::from_file(&ScenarioFile::parse(&sc.to_file(&proj).to_toml()).unwrap(), &proj).unwrap();
+        let back = Scenario::from_file(
+            &ScenarioFile::parse(&sc.to_file(&proj).to_toml()).unwrap(),
+            &proj,
+        )
+        .unwrap();
         assert!(back.sources[0].pos.distance(sc.sources[0].pos) < 0.2);
         assert_eq!(back.sources[0].rate, sc.sources[0].rate);
         assert_eq!(back.closures.len(), 1);
@@ -767,7 +797,9 @@ rect = [[90.0, 60.0], [110.0, 80.0]]
     fn event_crowd_detours_around_closure() {
         let m = plateau_gml::parse_str(include_str!("../../../testdata/sample.gml")).unwrap();
         let proj_grid = walkmap::WalkGrid::from_city(&m, 0.5).unwrap();
-        let mut sc = Scenario::from_file(&ScenarioFile::parse(SAMPLE).unwrap(), &proj_grid.projection).unwrap();
+        let mut sc =
+            Scenario::from_file(&ScenarioFile::parse(SAMPLE).unwrap(), &proj_grid.projection)
+                .unwrap();
 
         let run = |sc: &Scenario| {
             let mut grid = proj_grid.clone();
@@ -782,7 +814,13 @@ rect = [[90.0, 60.0], [110.0, 80.0]]
                 inside += sim
                     .agents
                     .iter()
-                    .filter(|a| !a.arrived && a.pos.x > 90.0 && a.pos.x < 110.0 && a.pos.y > 60.0 && a.pos.y < 80.0)
+                    .filter(|a| {
+                        !a.arrived
+                            && a.pos.x > 90.0
+                            && a.pos.x < 110.0
+                            && a.pos.y > 60.0
+                            && a.pos.y < 80.0
+                    })
                     .count();
             }
             (sp.total_spawned(), sim.active(), inside)

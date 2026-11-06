@@ -59,7 +59,8 @@ impl ZoneStats {
         for y in 0..grid.h {
             for x in 0..grid.w {
                 let p = grid.center(x, y) - grid.origin;
-                let z = ((p.y / size) as usize).min(ny - 1) * nx + ((p.x / size) as usize).min(nx - 1);
+                let z =
+                    ((p.y / size) as usize).min(ny - 1) * nx + ((p.x / size) as usize).min(nx - 1);
                 let i = grid.idx(x, y);
                 cell_zone[i] = z as u32;
                 if grid.walkable[i] {
@@ -106,7 +107,8 @@ impl ZoneStats {
     }
 
     fn zone_of(&self, g: &WalkGrid, p: Vec2) -> Option<usize> {
-        g.cell_of(p).map(|(x, y)| self.cell_zone[g.idx(x, y)] as usize)
+        g.cell_of(p)
+            .map(|(x, y)| self.cell_zone[g.idx(x, y)] as usize)
     }
 
     /// 1 ステップ（dt 秒）分を集計する。`cars` は (位置, 走行中か)。
@@ -288,7 +290,10 @@ impl ZoneStats {
         clock: impl Fn(f32) -> String,
         out: &mut impl Write,
     ) -> std::io::Result<()> {
-        writeln!(out, "t_end_s,clock,walking_avg,mean_speed_mps,stopped_ratio,cars_avg")?;
+        writeln!(
+            out,
+            "t_end_s,clock,walking_avg,mean_speed_mps,stopped_ratio,cars_avg"
+        )?;
         let mut rows = self.timeline.clone();
         let [n, v, s, c, w] = self.tl_acc;
         if w > 0.0 {
@@ -368,13 +373,25 @@ pub fn diff_png(g: &WalkGrid, before: &[f32], after: &[f32], closed: &[bool]) ->
     // 外れ値に引きずられないよう 99 パーセンタイルで正規化
     let mut abs: Vec<f32> = diff.iter().map(|d| d.abs()).filter(|d| *d > 0.0).collect();
     abs.sort_by(|a, b| a.total_cmp(b));
-    let scale = abs.get(abs.len() * 99 / 100).copied().unwrap_or(1.0).max(1e-6);
+    let scale = abs
+        .get(abs.len() * 99 / 100)
+        .copied()
+        .unwrap_or(1.0)
+        .max(1e-6);
     let mut img = Canvas::base(g);
     for y in 0..g.h {
         for x in 0..g.w {
             let i = g.idx(x, y);
             if closed.get(i).copied().unwrap_or(false) {
-                img.set(x, y, if (x + y) % 6 < 3 { [40, 40, 40] } else { [250, 210, 0] });
+                img.set(
+                    x,
+                    y,
+                    if (x + y) % 6 < 3 {
+                        [40, 40, 40]
+                    } else {
+                        [250, 210, 0]
+                    },
+                );
                 continue;
             }
             if !g.walkable[i] || diff[i] == 0.0 {
@@ -459,7 +476,15 @@ impl Canvas {
         for y in 0..g.h {
             for x in 0..g.w {
                 let i = g.idx(x, y);
-                c.set(x, y, if g.walkable[i] { [200, 200, 198] } else { [30, 30, 36] });
+                c.set(
+                    x,
+                    y,
+                    if g.walkable[i] {
+                        [200, 200, 198]
+                    } else {
+                        [30, 30, 36]
+                    },
+                );
             }
         }
         c
@@ -484,7 +509,11 @@ impl Canvas {
         let x0 = (self.w - bar_w) / 2;
         for i in 0..bar_w {
             let t = i as f32 / (bar_w - 1) as f32;
-            let c = if diverging { div_color(t * 2.0 - 1.0) } else { seq_color(t) };
+            let c = if diverging {
+                div_color(t * 2.0 - 1.0)
+            } else {
+                seq_color(t)
+            };
             for y in top..top + 8 {
                 self.put(x0 + i, y, c);
             }
@@ -602,15 +631,30 @@ impl ZoneStats {
         self.write_timeline_csv(&clock, &mut tl)?;
         put("timeline.csv", tl)?;
         put("heatmap.png", heat_png(g, &self.heat_rate()))?;
-        put("zones_passes_per_h.png", self.zone_png(g, &self.metric(ZoneMetric::PassesPerH)))?;
-        put("zones_avg_wait_s.png", self.zone_png(g, &self.metric(ZoneMetric::AvgWait)))?;
-        put("zones_avg_dwell_s.png", self.zone_png(g, &self.metric(ZoneMetric::AvgDwell)))?;
+        put(
+            "zones_passes_per_h.png",
+            self.zone_png(g, &self.metric(ZoneMetric::PassesPerH)),
+        )?;
+        put(
+            "zones_avg_wait_s.png",
+            self.zone_png(g, &self.metric(ZoneMetric::AvgWait)),
+        )?;
+        put(
+            "zones_avg_dwell_s.png",
+            self.zone_png(g, &self.metric(ZoneMetric::AvgDwell)),
+        )?;
         if let Some(b) = before.filter(|b| b.heat.len() == self.heat.len()) {
-            put("diff_heatmap.png", diff_png(g, &b.heat_rate(), &self.heat_rate(), closed))?;
+            put(
+                "diff_heatmap.png",
+                diff_png(g, &b.heat_rate(), &self.heat_rate(), closed),
+            )?;
             let bm = b.metric(ZoneMetric::PassesPerH);
             let am = self.metric(ZoneMetric::PassesPerH);
             if bm.len() == am.len() {
-                put("diff_zones_passes_per_h.png", before_after_zone_diff(self, g, &bm, &am))?;
+                put(
+                    "diff_zones_passes_per_h.png",
+                    before_after_zone_diff(self, g, &bm, &am),
+                )?;
             }
         }
         Ok(files)
@@ -654,7 +698,8 @@ mod tests {
         let passes: u32 = st.ped_passes.iter().sum();
         assert!(passes >= 100, "初期配置の区画も 1 回と数える: {passes}");
         let mut csv = vec![];
-        st.write_zones_csv(&sim.grid, Some(&st.clone()), &mut csv).unwrap();
+        st.write_zones_csv(&sim.grid, Some(&st.clone()), &mut csv)
+            .unwrap();
         let text = String::from_utf8(csv).unwrap();
         assert!(text.lines().count() > 10);
         assert!(text.lines().nth(1).unwrap().split(',').count() == 24);
