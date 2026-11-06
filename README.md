@@ -10,8 +10,9 @@ crates/
   walkmap/      緯度経度→局所平面、歩行可能グリッド、フローフィールド、障害物距離場
   crowd/        Social Force Model による歩行者の計算
   traffic/      車道の中心線ネットワーク抽出と車両の計算（IDM・左側通行・交差点制御）
-  cli/          ヘッドレス実行。軌跡 CSV と通行量ヒートマップ PNG を出力
+  cli/          ヘッドレス実行。軌跡 CSV と通行量ヒートマップ PNG、区画別の集計 CSV・画像を出力
   viewer/       bevy 0.16 による 3D ビューア（建物の押し出し表示 + 歩行者 + ヒートマップ）
+scenarios/      イベント・混雑シナリオと通行止めの設定例（TOML）
 scripts/        公式 CityGML の取得 (fetch-ginza.sh) と範囲切り出し (extract_gml.py)
 testdata/
   sample.gml    合成テストデータ（東京駅付近 200m 四方、幅 20m の「井」の字の道路と 15 棟）
@@ -137,13 +138,89 @@ ffmpeg -framerate 30 -i rec/frame_%05d.png -c:v libx264 -pix_fmt yuv420p sim.mp4
 
 ![cars](docs/viewer-cars.png)
 
+## シナリオ・通行止め・結果のエクスポート
+
+### イベント・混雑シナリオ（`--scenario`）
+
+TOML の設定ファイルで、駅出口や会場などの**発生源**と時刻ごとの発生人数、**行き先**、**通行止め・工事**を指定できます。
+例: [`scenarios/ginza-evening.toml`](scenarios/ginza-evening.toml)（銀座の夕方の帰宅ラッシュ＋終演後の観客＋晴海通りの工事）。
+
+```toml
+[scenario]
+name = "銀座 夕方"
+start = "18:00"            # 時刻を "HH:MM" で書けるようにする基準
+duration = "18:20"         # 計算の終わり（秒数でも可）
+background_agents = 300    # 発生源とは別に範囲を通り抜ける人
+vehicles = 30
+zone_size = 20             # 集計区画の一辺 [m]
+
+[[source]]                 # 発生源
+name = "銀座駅 交差点北西口"
+at = [35.671542, 139.764735]   # [緯度, 経度]（coords = "local" なら [x, y] m）
+radius = 6
+rate = [["18:00", 10], ["18:05", 40], ["18:15", 40], ["18:20", 10]]  # [時刻, 人/分]、間は直線
+to = ["有楽町方面", "西", "北"]  # 行き先（destination の名前か、範囲の縁の 東/西/南/北）
+weights = [3, 1, 1]
+
+[[destination]]            # 行き先
+name = "有楽町方面"
+at = [35.672863, 139.762733]
+radius = 8
+
+[[closure]]                # 通行止め・工事
+name = "晴海通りの工事"
+kind = "all"               # all（全面）/ sidewalk（歩道のみ）/ road（車道のみ。車も通れない）
+line = [[35.671723, 139.764004], [35.672124, 139.764448]]  # polygon / rect / line(+width) のどれか
+width = 8
+```
+
+- 発生源の人は時刻に応じて出現し（出口が混んでいると出口で待つ）、行き先に着くと消えます。
+- 通行止めは歩行空間（グリッド）を塞ぎ、`all` / `road` は車道の中心線グラフの区間も外します。車は迂回するか U ターンします。
+
+### 結果のエクスポート（`--export`）と Before/After 比較（`--compare`）
+
+```sh
+cargo run --release -- --gml testdata/ginza/53394601_bldg_6697_op.gml --gml testdata/ginza/53394601_tran_6697_op.gml \
+    --crop 35.67165,139.76500,220 --scenario scenarios/ginza-evening.toml --compare --export out/ginza-evening
+```
+
+`--compare` は同じシナリオを通行止めなし（Before）とあり（After）で続けて計算します。`--export` のディレクトリには次を書き出します。
+
+| ファイル | 内容 |
+|---|---|
+| `zones.csv` | 区画（既定 20m 四方）ごとの 通過人数（延べ・1 時間あたり）、平均滞留時間、平均待ち時間（0.3 m/s 未満で止まっていた時間）、最大人数・最大密度 [人/m²]、車の通過台数。比較時は `before_*` と `diff_*` 列も |
+| `timeline.csv` | 1 分ごとの歩行者数・平均速度・停止している人の割合・車の台数 |
+| `heatmap.png` / `zones_*.png` | 通行量のヒートマップと、区画ごとの通過人数・待ち時間・滞留時間の地図（下端に凡例） |
+| `diff_heatmap.png` / `diff_zones_passes_per_h.png` | After − Before（1 秒あたりに正規化）。赤=増えた、青=減った、黄黒の斜線=通行止め |
+| `before/` | Before 側の同じ一式 |
+
+`--map-png` の確認用地図にも、通行止め（黄黒の斜線）・発生源（緑の円）・行き先（紫の円）が描かれます。
+
+![通行止めの差分](docs/ginza-closure-diff.png)
+
+晴海通りの有楽町寄りを全面通行止めにしたときの差分。晴海通り（青）を通っていた人が、北側の並行する通り（赤）へ迂回しています。
+
+![区画ごとの平均待ち時間](docs/ginza-zones-wait.png)
+
+### ビューアのシナリオパネル
+
+`--scenario` を付けて起動するか、左の「シナリオ・通行止め・結果」パネルでファイルを読み込みます。
+
+- 発生源ごとに有効/無効、時刻と人数の折れ線（点の追加・削除）、行き先と重み、歩行速度を編集
+- 「地図に置く」で、地図をクリックして発生源・行き先を、ドラッグして通行止め（線＋幅、または長方形）を置ける
+- 通行止めの種類（全面・歩道のみ・車道のみ）の変更、全体の有効/無効の切り替え
+- Before/After: 通行止めを無効にして走らせ「いまの結果を Before に」→ 有効にして「適用」→「差分ヒートマップ」
+- 「CSV と画像を書き出す」で上の一式と、編集後のシナリオ（`scenario.toml`）を書き出す。「保存」で編集内容を TOML に保存
+
+![scenario panel](docs/viewer-scenario.png)
+
 ## ロードマップ
 
 - [x] MVP: CityGML 読込 → グリッド → フローフィールド → Social Force → CSV/PNG
 - [x] 実データ検証（渋谷 4 メッシュの OBJ、CityGML 抜粋）
 - [x] CityGML LOD2/LOD3 の `tran:TrafficArea`（車道部・歩道部・島）を使った歩道判定（銀座で検証）
 - [ ] 横断歩道の位置（PLATEAU の道路データに横断歩道の面が無いので別データが要る）
-- [ ] シナリオ定義（TOML）: 出発地・目的地（駅出口など）・発生レート・時間帯
+- [x] シナリオ定義（TOML）: 出発地・目的地（駅出口など）・発生レート・時間帯、通行止め・工事、区画別の集計と Before/After 比較
 - [x] 可視化: bevy で 3D 建物 + エージェントのリアルタイム表示
 - [ ] 可視化の拡張: LOD2 の屋根形状・テクスチャ、地形 (dem)、wasm + WebGPU でブラウザ表示
 - [ ] 速度向上: rayon による並列化、密度に応じた計算（数万人規模）
