@@ -5,6 +5,7 @@
 
 mod camera;
 mod geometry;
+mod ui;
 
 use anyhow::{bail, Context, Result};
 use bevy::prelude::*;
@@ -13,6 +14,7 @@ use crowd::{Rng, Simulation};
 use geometry::{dashed_line, to_world, walkable_surface, MeshBuilder};
 use std::path::PathBuf;
 use traffic::{RoadGraph, Traffic};
+use ui::Settings;
 use walkmap::WalkGrid;
 
 const DT: f32 = 0.05;
@@ -33,6 +35,7 @@ struct Args {
     speed: f32,
     orbit: f32,
     warmup: f32,
+    ui_font: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -48,6 +51,7 @@ fn parse_args() -> Result<Args> {
         speed: 2.0,
         orbit: 0.0,
         warmup: 0.0,
+        ui_font: None,
         cell: 0.5,
         seed: 1,
         respawn: true,
@@ -121,11 +125,13 @@ fn parse_args() -> Result<Args> {
             "--orbit" => a.orbit = v()?.parse()?,
             // 録画前に進めておくシミュレーション時間 [s]
             "--warmup" => a.warmup = v()?.parse()?,
+            // 設定パネルの日本語フォント（省略時は OS の定番フォントを探す）
+            "--ui-font" => a.ui_font = Some(v()?.into()),
             "-h" | "--help" => {
                 println!(
                     "usage: plateau-crowd-viewer (--gml <file|dir> | --obj <file|dir> --obj-origin 緯度,経度)... [--crop 緯度,経度,半径m] [--agents N] [--vehicles N] [--cell M] [--seed N]\n\
                      \x20                          [--no-respawn] [--screenshot out.png <sim秒>]\n\
-                     \x20                          [--record <dir> <動画の秒数>] [--fps 30] [--speed 2] [--orbit rad/s] [--warmup 秒]"
+                     \x20                          [--record <dir> <動画の秒数>] [--fps 30] [--speed 2] [--orbit rad/s] [--warmup 秒] [--ui-font font.ttf]"
                 );
                 std::process::exit(0);
             }
@@ -176,24 +182,64 @@ fn load_model(args: &Args) -> Result<(plateau_gml::CityModel, Option<(f64, f64, 
 }
 
 #[derive(Resource)]
-struct SimState {
-    sim: Simulation,
-    traffic: Option<Traffic>,
+pub struct SimState {
+    pub sim: Simulation,
+    pub traffic: Option<Traffic>,
+    /// 作り直し用に保持する道路網
+    road_graph: Option<RoadGraph>,
     rng: Rng,
     /// 目的地ごとの到着セル（再出現位置に使う）
     goal_cells: Vec<Vec<(usize, usize)>>,
-    respawn: bool,
-    speed: f32,
-    paused: bool,
+    pub respawn: bool,
+    pub speed: f32,
+    pub paused: bool,
     acc: f32,
     heat: Vec<u32>,
-    heat_dirty: bool,
+    pub heat_dirty: bool,
+}
+
+/// グリッドと道路網から歩行者・車のシミュレーションを組み立てる。
+fn build_sim(
+    grid: WalkGrid,
+    road_graph: Option<&RoadGraph>,
+    st: &Settings,
+) -> Result<(Simulation, Option<Traffic>, Vec<Vec<(usize, usize)>>)> {
+    let traffic = match road_graph {
+        Some(net) if st.vehicles > 0 => {
+            let params = traffic::Params {
+                speed_limit: st.speed_limit_kmh / 3.6,
+                ..Default::default()
+            };
+            Some(Traffic::new_with(net.clone(), st.vehicles, st.seed, params))
+        }
+        _ => None,
+    };
+    let (mut sim, _names) = crowd::scenario::through_traffic(grid, st.agents, st.seed)
+        .context("範囲の縁に歩行可能領域がありません")?;
+    let k = st.walk_speed / 1.34;
+    for a in sim.agents.iter_mut() {
+        a.desired_speed = (a.desired_speed * k).clamp(0.3, 3.0);
+    }
+    let goal_cells = sim
+        .goals
+        .iter()
+        .map(|ff| {
+            sim.grid
+                .walkable_cells()
+                .filter(|&(x, y)| ff.dist[sim.grid.idx(x, y)] == 0.0)
+                .collect()
+        })
+        .collect();
+    Ok((sim, traffic, goal_cells))
 }
 
 #[derive(Resource)]
 struct Visuals {
     goal_materials: Vec<Handle<StandardMaterial>>,
     heat_image: Handle<Image>,
+    body: Handle<Mesh>,
+    car_mats: Vec<Handle<StandardMaterial>>,
+    glass: Handle<StandardMaterial>,
 }
 
 #[derive(Resource)]
@@ -207,7 +253,7 @@ struct ScreenshotPlan {
 struct AgentVis(usize);
 
 #[derive(Component)]
-struct HeatOverlay;
+pub struct HeatOverlay;
 
 #[derive(Component)]
 struct CarVis(usize);
@@ -239,33 +285,28 @@ fn main() -> Result<()> {
     );
     let grid = WalkGrid::from_city_bounds(&model, args.cell, bounds)
         .context("座標を含む地物がありません")?;
-    let traffic = (args.vehicles > 0 && grid.has_roads).then(|| {
+    let road_graph = grid.has_roads.then(|| {
         let net = RoadGraph::from_grid(&grid, crowd::scenario::SIDEWALK_W);
         info!(
             "道路網: ノード {}, 区間 {}",
             net.nodes.len(),
             net.edges.len()
         );
-        Traffic::new(net, args.vehicles, args.seed)
+        net
     });
-    let (sim, names) = crowd::scenario::through_traffic(grid, args.agents, args.seed)
-        .context("範囲の縁に歩行可能領域がありません")?;
-    info!("目的地 {:?}, エージェント {} 人", names, sim.agents.len());
+    let settings = Settings::new(args.agents, args.vehicles, args.seed, args.respawn);
+    let (sim, traffic, goal_cells) = build_sim(grid, road_graph.as_ref(), &settings)?;
+    info!(
+        "エージェント {} 人, 車 {} 台",
+        sim.agents.len(),
+        traffic.as_ref().map_or(0, |t| t.vehicles.len())
+    );
 
-    let goal_cells = sim
-        .goals
-        .iter()
-        .map(|ff| {
-            sim.grid
-                .walkable_cells()
-                .filter(|&(x, y)| ff.dist[sim.grid.idx(x, y)] == 0.0)
-                .collect()
-        })
-        .collect();
     let heat = vec![0; sim.grid.w * sim.grid.h];
     let state = SimState {
         sim,
         traffic,
+        road_graph,
         rng: Rng::new(args.seed ^ 0x9E37_79B9),
         goal_cells,
         respawn: args.respawn,
@@ -291,10 +332,19 @@ fn main() -> Result<()> {
         ..default()
     })
     .insert_resource(state)
+    .insert_resource(settings)
+    .insert_resource(UiFont(args.ui_font.clone()))
+    .init_resource::<camera::UiCapture>()
+    .add_plugins(bevy_egui::EguiPlugin {
+        enable_multipass_for_primary_context: false,
+    })
     .add_systems(Startup, setup)
     .add_systems(
         Update,
         (
+            install_ui_font,
+            ui::settings_panel,
+            apply_settings,
             camera::orbit_camera,
             controls,
             step_sim,
@@ -377,13 +427,10 @@ fn setup(
         ));
     }
     // センターライン（交差点内は描かない）
-    if let Some(t) = &state.traffic {
+    if let Some(net) = &state.road_graph {
         let mut lines = MeshBuilder::default();
-        for e in &t.graph.edges {
-            let trim = (
-                t.graph.nodes[e.a].radius + 1.0,
-                t.graph.nodes[e.b].radius + 1.0,
-            );
+        for e in &net.edges {
+            let trim = (net.nodes[e.a].radius + 1.0, net.nodes[e.b].radius + 1.0);
             dashed_line(&mut lines, &e.pts, 0.15, 3.0, 3.0, trim, 0.01);
         }
         if !lines.is_empty() {
@@ -396,7 +443,9 @@ fn setup(
                 })),
             ));
         }
-        // 車: 車体 + 客室の 2 つの箱
+    }
+    // 車: 車体 + 客室の 2 つの箱
+    let car_mats = {
         let car_colors = [
             Color::srgb(0.95, 0.95, 0.95),
             Color::srgb(0.12, 0.12, 0.14),
@@ -405,7 +454,7 @@ fn setup(
             Color::srgb(0.10, 0.25, 0.55),
             Color::srgb(0.85, 0.75, 0.20),
         ];
-        let car_mats: Vec<_> = car_colors
+        car_colors
             .iter()
             .map(|&c| {
                 materials.add(StandardMaterial {
@@ -415,51 +464,13 @@ fn setup(
                     ..default()
                 })
             })
-            .collect();
-        let glass = materials.add(StandardMaterial {
-            base_color: Color::srgb(0.10, 0.13, 0.18),
-            perceptual_roughness: 0.1,
-            ..default()
-        });
-        for (i, v) in t.vehicles.iter().enumerate() {
-            let truck = v.length > 6.0;
-            let (body_h, cabin) = if truck {
-                (2.6, (1.8, 2.3, v.length * 0.5 - 0.9)) // 荷台の前に運転台
-            } else {
-                (0.75, (v.length * 0.5, 0.6, -0.2))
-            };
-            commands
-                .spawn((
-                    CarVis(i),
-                    Transform::from_translation(to_world(v.pos, 0.0)),
-                    Visibility::Inherited,
-                ))
-                .with_children(|c| {
-                    let body_len = if truck { v.length - 2.0 } else { v.length };
-                    let body_x = if truck { -1.0 } else { 0.0 };
-                    c.spawn((
-                        Mesh3d(meshes.add(Cuboid::new(body_len, body_h, v.width))),
-                        MeshMaterial3d(car_mats[v.style as usize % car_mats.len()].clone()),
-                        Transform::from_xyz(body_x, 0.3 + body_h * 0.5, 0.0),
-                    ));
-                    let (cl, ch, cx) = cabin;
-                    let cy = if truck {
-                        0.3 + ch * 0.5
-                    } else {
-                        0.3 + body_h + ch * 0.5
-                    };
-                    c.spawn((
-                        Mesh3d(meshes.add(Cuboid::new(cl, ch, v.width * 0.92))),
-                        MeshMaterial3d(if truck {
-                            car_mats[0].clone()
-                        } else {
-                            glass.clone()
-                        }),
-                        Transform::from_xyz(cx, cy, 0.0),
-                    ));
-                });
-        }
-    }
+            .collect::<Vec<_>>()
+    };
+    let glass = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.10, 0.13, 0.18),
+        perceptual_roughness: 0.1,
+        ..default()
+    });
     // 通行量ヒートマップ（歩行面のすぐ上に半透明で重ねる）
     let heat_image = images.add(heat_image_new(g.w as u32, g.h as u32));
     commands.spawn((
@@ -516,7 +527,7 @@ fn setup(
         ));
     }
 
-    // 歩行者: 目的地ごとに色分けしたカプセル
+    // 歩行者の色: 目的地ごと
     let palette = [
         Color::srgb(0.90, 0.25, 0.20),
         Color::srgb(0.15, 0.45, 0.90),
@@ -532,14 +543,14 @@ fn setup(
         })
         .collect();
     let body = meshes.add(Capsule3d::new(0.22, 1.2));
-    for (i, a) in state.sim.agents.iter().enumerate() {
-        commands.spawn((
-            AgentVis(i),
-            Mesh3d(body.clone()),
-            MeshMaterial3d(goal_materials[a.goal].clone()),
-            Transform::from_translation(to_world(a.pos, 0.82)),
-        ));
-    }
+    let visuals = Visuals {
+        goal_materials,
+        heat_image,
+        body,
+        car_mats,
+        glass,
+    };
+    spawn_entities(&mut commands, &mut meshes, &visuals, &state);
 
     // 光源とカメラ
     commands.spawn((
@@ -587,10 +598,125 @@ fn setup(
         },
     ));
 
-    commands.insert_resource(Visuals {
-        goal_materials,
-        heat_image,
-    });
+    commands.insert_resource(visuals);
+}
+
+/// 歩行者と車のエンティティを現在の `SimState` に合わせて生成する。
+fn spawn_entities(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    visuals: &Visuals,
+    state: &SimState,
+) {
+    for (i, a) in state.sim.agents.iter().enumerate() {
+        commands.spawn((
+            AgentVis(i),
+            Mesh3d(visuals.body.clone()),
+            MeshMaterial3d(visuals.goal_materials[a.goal].clone()),
+            Transform::from_translation(to_world(a.pos, 0.82)),
+        ));
+    }
+    let Some(t) = &state.traffic else { return };
+    for (i, v) in t.vehicles.iter().enumerate() {
+        let truck = v.length > 6.0;
+        let (body_h, cabin) = if truck {
+            (2.6, (1.8, 2.3, v.length * 0.5 - 0.9)) // 荷台の前に運転台
+        } else {
+            (0.75, (v.length * 0.5, 0.6, -0.2))
+        };
+        commands
+            .spawn((
+                CarVis(i),
+                Transform::from_translation(to_world(v.pos, 0.0)),
+                Visibility::Inherited,
+            ))
+            .with_children(|c| {
+                let body_len = if truck { v.length - 2.0 } else { v.length };
+                let body_x = if truck { -1.0 } else { 0.0 };
+                c.spawn((
+                    Mesh3d(meshes.add(Cuboid::new(body_len, body_h, v.width))),
+                    MeshMaterial3d(
+                        visuals.car_mats[v.style as usize % visuals.car_mats.len()].clone(),
+                    ),
+                    Transform::from_xyz(body_x, 0.3 + body_h * 0.5, 0.0),
+                ));
+                let (cl, ch, cx) = cabin;
+                let cy = if truck {
+                    0.3 + ch * 0.5
+                } else {
+                    0.3 + body_h + ch * 0.5
+                };
+                c.spawn((
+                    Mesh3d(meshes.add(Cuboid::new(cl, ch, v.width * 0.92))),
+                    MeshMaterial3d(if truck {
+                        visuals.car_mats[0].clone()
+                    } else {
+                        visuals.glass.clone()
+                    }),
+                    Transform::from_xyz(cx, cy, 0.0),
+                ));
+            });
+    }
+}
+
+#[derive(Resource)]
+struct UiFont(Option<PathBuf>);
+
+/// egui のコンテキストができてから一度だけ日本語フォントを登録する。
+fn install_ui_font(
+    mut done: Local<bool>,
+    mut contexts: bevy_egui::EguiContexts,
+    font: Res<UiFont>,
+) {
+    if *done {
+        return;
+    }
+    if let Some(ctx) = contexts.try_ctx_mut() {
+        ui::install_fonts(ctx, font.0.as_deref());
+        *done = true;
+    }
+}
+
+/// 「適用」でシミュレーションを作り直し、エンティティを張り替える。
+fn apply_settings(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut settings: ResMut<Settings>,
+    mut state: ResMut<SimState>,
+    visuals: Res<Visuals>,
+    agents: Query<Entity, With<AgentVis>>,
+    cars: Query<Entity, With<CarVis>>,
+) {
+    if !settings.apply_requested {
+        return;
+    }
+    settings.apply_requested = false;
+    let st = &mut *state;
+    match build_sim(st.sim.grid.clone(), st.road_graph.as_ref(), &settings) {
+        Ok((sim, traffic, goal_cells)) => {
+            st.sim = sim;
+            st.traffic = traffic;
+            st.goal_cells = goal_cells;
+        }
+        Err(e) => {
+            error!("作り直しに失敗: {e:#}");
+            return;
+        }
+    }
+    st.rng = Rng::new(settings.seed ^ 0x9E37_79B9);
+    st.respawn = settings.respawn;
+    st.acc = 0.0;
+    st.heat.iter_mut().for_each(|h| *h = 0);
+    st.heat_dirty = true;
+    for e in agents.iter().chain(cars.iter()) {
+        commands.entity(e).despawn();
+    }
+    spawn_entities(&mut commands, &mut meshes, &visuals, st);
+    info!(
+        "作り直し: 歩行者 {} 人, 車 {} 台",
+        st.sim.agents.len(),
+        st.traffic.as_ref().map_or(0, |t| t.vehicles.len())
+    );
 }
 
 fn heat_image_new(w: u32, h: u32) -> Image {
@@ -745,7 +871,9 @@ fn sync_agents(
     )>,
 ) {
     for (AgentVis(i), mut tf, mut vis, mut mat) in &mut q {
-        let a = &state.sim.agents[*i];
+        let Some(a) = state.sim.agents.get(*i) else {
+            continue;
+        };
         let want = if a.arrived {
             Visibility::Hidden
         } else {
@@ -764,7 +892,9 @@ fn sync_agents(
 fn sync_cars(state: Res<SimState>, mut q: Query<(&CarVis, &mut Transform, &mut Visibility)>) {
     let Some(t) = &state.traffic else { return };
     for (CarVis(i), mut tf, mut vis) in &mut q {
-        let v = &t.vehicles[*i];
+        let Some(v) = t.vehicles.get(*i) else {
+            continue;
+        };
         let want = if v.active {
             Visibility::Inherited
         } else {

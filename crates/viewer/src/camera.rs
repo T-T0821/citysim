@@ -11,14 +11,19 @@ pub struct OrbitCamera {
     pub distance: f32,
 }
 
+/// UI がマウスを使っている間はカメラ操作を止める
+#[derive(Resource, Default)]
+pub struct UiCapture(pub bool);
+
 pub fn orbit_camera(
+    ui: Res<UiCapture>,
     buttons: Res<ButtonInput<MouseButton>>,
     motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
     mut q: Query<(&mut OrbitCamera, &mut Transform)>,
 ) {
     for (mut cam, mut tf) in &mut q {
-        let d = motion.delta;
+        let d = if ui.0 { Vec2::ZERO } else { motion.delta };
         if buttons.pressed(MouseButton::Left) {
             cam.yaw -= d.x * 0.005;
             cam.pitch = (cam.pitch + d.y * 0.005).clamp(0.05, 1.55);
@@ -30,9 +35,13 @@ pub fn orbit_camera(
             let k = cam.distance * 0.0015;
             cam.target += (-right * d.x + fwd * d.y) * k;
         }
-        let s = match scroll.unit {
-            MouseScrollUnit::Line => scroll.delta.y,
-            MouseScrollUnit::Pixel => scroll.delta.y / 40.0,
+        let s = if ui.0 {
+            0.0
+        } else {
+            match scroll.unit {
+                MouseScrollUnit::Line => scroll.delta.y,
+                MouseScrollUnit::Pixel => scroll.delta.y / 40.0,
+            }
         };
         if s != 0.0 {
             cam.distance = (cam.distance * (1.0 - s * 0.1)).clamp(5.0, 20_000.0);

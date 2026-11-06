@@ -28,6 +28,8 @@ pub struct Params {
     pub creep_after: f32,
     /// 交差点でこの秒数待たされたら通行権を待たずに進む
     pub deadlock_after: f32,
+    /// 希望速度の上限 [m/s]（各車はこの 70〜100%）
+    pub speed_limit: f32,
 }
 
 impl Default for Params {
@@ -42,6 +44,7 @@ impl Default for Params {
             lock_hold: 6.0,
             creep_after: 5.0,
             deadlock_after: 15.0,
+            speed_limit: 13.0,
         }
     }
 }
@@ -104,6 +107,10 @@ pub struct Traffic {
 
 impl Traffic {
     pub fn new(graph: RoadGraph, n_vehicles: usize, seed: u64) -> Self {
+        Self::new_with(graph, n_vehicles, seed, Params::default())
+    }
+
+    pub fn new_with(graph: RoadGraph, n_vehicles: usize, seed: u64, params: Params) -> Self {
         let entries: Vec<Lane> = graph
             .nodes
             .iter()
@@ -121,7 +128,7 @@ impl Traffic {
         let mut t = Self {
             graph,
             vehicles: vec![],
-            params: Params::default(),
+            params,
             time: 0.0,
             locks,
             rng: seed.max(1),
@@ -181,7 +188,7 @@ impl Traffic {
     fn make_vehicle(&mut self, lane: Lane, s: f32) -> Vehicle {
         let style = self.rand(1 << 16) as u32;
         let truck = style % 10 == 0;
-        let v0 = 9.0 + 4.0 * self.randf(); // 32〜47 km/h
+        let v0 = self.params.speed_limit * (0.7 + 0.3 * self.randf());
         let mut v = Vehicle {
             lane,
             s,

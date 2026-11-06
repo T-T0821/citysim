@@ -73,6 +73,15 @@ cargo run --release -p plateau-crowd-viewer -- --obj data/shibuya --obj-origin 3
 cargo run --release -p plateau-crowd-viewer -- --gml testdata/sample.gml --agents 600 --vehicles 30
 ```
 
+画面右の設定パネル（egui）で、歩行者数・車両数・平均歩行速度・制限速度・乱数シード・到着後の再投入を変えて
+「適用して最初から」で作り直せます。一時停止、再生速度、ヒートマップ表示、時刻リセットと、歩行者・車の平均速度などの状態表示もここにあります。
+パネルの日本語表示には OS の日本語フォント（Noto Sans CJK、IPA ゴシック、ヒラギノ、メイリオなど）を自動で探します。
+見つからない場合は `--ui-font <フォントファイル>` か環境変数 `PLATEAU_UI_FONT` で指定してください。
+
+![settings](docs/viewer-settings.png)
+
+キーボード・マウス:
+
 | 操作 | 内容 |
 |---|---|
 | 左ドラッグ / 右ドラッグ / ホイール | 回転 / 平行移動 / ズーム |
@@ -91,7 +100,7 @@ cargo run --release -p plateau-crowd-viewer -- --gml testdata/sample.gml --agent
 ffmpeg -framerate 30 -i rec/frame_%05d.png -c:v libx264 -pix_fmt yuv420p sim.mp4
 ```
 
-Linux では `libxkbcommon-x11-0` と Vulkan ドライバ（GPU のもの、または `mesa-vulkan-drivers`）が必要です。
+外部依存は quick-xml / glam / bevy / bevy_egui です。Linux では `libxkbcommon-x11-0` と Vulkan ドライバ（GPU のもの、または `mesa-vulkan-drivers`）が必要です。
 
 ![viewer](docs/viewer.png)
 
