@@ -338,7 +338,10 @@ pub fn prepare(
     for mesh in &meshes {
         let local = find_local(data_dir, std::slice::from_ref(mesh));
         if !local.is_empty() {
-            progress(&format!("{mesh}: 手元のファイルを使います（{} 件）", local.len()));
+            progress(&format!(
+                "{mesh}: 手元のファイルを使います（{} 件）",
+                local.len()
+            ));
             files.extend(local);
             continue;
         }
@@ -351,7 +354,9 @@ pub fn prepare(
             }
         };
         if remote.is_empty() {
-            errors.push(format!("{mesh}: このメッシュの建物・道路データは配信されていません"));
+            errors.push(format!(
+                "{mesh}: このメッシュの建物・道路データは配信されていません"
+            ));
             continue;
         }
         for f in remote {
@@ -417,7 +422,10 @@ mod tests {
     #[test]
     fn latlon_input() {
         assert_eq!(parse_latlon("35.67165,139.765"), Some((35.67165, 139.765)));
-        assert_eq!(parse_latlon(" 35.67165 , 139.765 "), Some((35.67165, 139.765)));
+        assert_eq!(
+            parse_latlon(" 35.67165 , 139.765 "),
+            Some((35.67165, 139.765))
+        );
         assert_eq!(parse_latlon("35.67165，139.765"), Some((35.67165, 139.765)));
         assert_eq!(parse_latlon("139.765, 35.67165"), Some((35.67165, 139.765)));
         assert_eq!(parse_latlon("東京都中央区銀座4丁目"), None);
@@ -450,7 +458,10 @@ mod tests {
             ]}}"#
         );
         let f = parse_citygml_api(&body, "53394601");
-        let got: Vec<_> = f.iter().map(|f| (f.dataset.as_str(), f.kind.as_str(), f.year)).collect();
+        let got: Vec<_> = f
+            .iter()
+            .map(|f| (f.dataset.as_str(), f.kind.as_str(), f.year))
+            .collect();
         assert_eq!(
             got,
             vec![

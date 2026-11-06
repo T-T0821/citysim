@@ -181,8 +181,12 @@ fn compute_fields(
     }
     for &(a, b, r) in obstacles {
         let r = r + 0.4;
-        let lo = ((a.min(b) - Vec2::splat(r) - g.origin) / g.cell).floor().as_ivec2();
-        let hi = ((a.max(b) + Vec2::splat(r) - g.origin) / g.cell).ceil().as_ivec2();
+        let lo = ((a.min(b) - Vec2::splat(r) - g.origin) / g.cell)
+            .floor()
+            .as_ivec2();
+        let hi = ((a.max(b) + Vec2::splat(r) - g.origin) / g.cell)
+            .ceil()
+            .as_ivec2();
         for y in lo.y.max(0)..=hi.y.min(g.h as i32 - 1) {
             for x in lo.x.max(0)..=hi.x.min(g.w as i32 - 1) {
                 let c = g.center(x as usize, y as usize);
@@ -229,13 +233,11 @@ fn shelter_cells(sim: &Simulation, pos: Vec2, r: f32) -> Vec<(usize, usize)> {
     }
     // 避難所が建物の中（公園の中央・校舎など）を指していたら、最寄りの歩行空間を入口とみなす
     let around = near(pos, 30.0);
-    match around
-        .iter()
-        .min_by(|a, b| {
-            g.center(a.0, a.1)
-                .distance(pos)
-                .total_cmp(&g.center(b.0, b.1).distance(pos))
-        }) {
+    match around.iter().min_by(|a, b| {
+        g.center(a.0, a.1)
+            .distance(pos)
+            .total_cmp(&g.center(b.0, b.1).distance(pos))
+    }) {
         Some(&(x, y)) => near(g.center(x, y), r),
         None => vec![],
     }
@@ -271,7 +273,11 @@ mod tests {
         }
         assert!(ev.done(), "残り {}", ev.remaining());
         assert_eq!(ev.evacuated() + ev.unreachable, ev.total);
-        assert!(ev.shelters.iter().all(|s| s.arrived > 0), "{:?}", ev.shelters);
+        assert!(
+            ev.shelters.iter().all(|s| s.arrived > 0),
+            "{:?}",
+            ev.shelters
+        );
         let t90 = ev.time_to_fraction(0.9).unwrap();
         let t100 = ev.time_to_fraction(1.0).unwrap();
         assert!(t90 <= t100 && t100 > 0.0);

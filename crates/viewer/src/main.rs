@@ -4,6 +4,8 @@
 //!       Space=一時停止 / ↑↓=再生速度 / H=ヒートマップ表示切替
 
 mod camera;
+mod evac;
+mod place;
 mod geometry;
 mod signals;
 mod ui;
@@ -39,6 +41,11 @@ struct Args {
     ui_font: Option<PathBuf>,
     /// 信号機（None = 信号なし）
     signals: Option<traffic::SignalConfig>,
+    place: Option<String>,
+    radius: f64,
+    data_dir: PathBuf,
+    shelters: Vec<(String, f64, f64)>,
+    evacuate_at: Option<f32>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -56,6 +63,11 @@ fn parse_args() -> Result<Args> {
         warmup: 0.0,
         ui_font: None,
         signals: Some(traffic::SignalConfig::default()),
+        place: None,
+        radius: 220.0,
+        data_dir: PathBuf::from(place::DEFAULT_DATA_DIR),
+        shelters: vec![],
+        evacuate_at: None,
         cell: 0.5,
         seed: 1,
         respawn: true,
@@ -152,20 +164,40 @@ fn parse_args() -> Result<Args> {
                     c.cycle = x;
                 }
             }
+            // 場所（住所 or 緯度,経度）。--gml が無ければ PLATEAU の CityGML を自動で取得する
+            "--place" => a.place = Some(v()?),
+            "--radius" => a.radius = v()?.parse()?,
+            "--data-dir" => a.data_dir = v()?.into(),
+            // 避難所: 緯度,経度[,名前]（複数可）
+            "--shelter" => a.shelters.push(evac::parse_shelter(&v()?)?),
+            // この時刻 [s] に避難を始める
+            "--evacuate-at" => a.evacuate_at = Some(v()?.parse()?),
             "-h" | "--help" => {
                 println!(
                     "usage: plateau-crowd-viewer (--gml <file|dir> | --obj <file|dir> --obj-origin 緯度,経度)... [--crop 緯度,経度,半径m] [--agents N] [--vehicles N] [--cell M] [--seed N]\n\
                      \x20                          [--no-respawn] [--screenshot out.png <sim秒>]\n\
                      \x20                          [--record <dir> <動画の秒数>] [--fps 30] [--speed 2] [--orbit rad/s] [--warmup 秒] [--ui-font font.ttf]\n\
-                     \x20                          [--signals auto|concurrent|exclusive|scramble|off] [--cycle S]"
+                     \x20                          [--signals auto|concurrent|exclusive|scramble|off] [--cycle S]\n\
+                     \x20                          [--place <住所|緯度,経度>] [--radius m] [--data-dir data/plateau] [--shelter 緯度,経度[,名前]]... [--evacuate-at 秒]"
                 );
                 std::process::exit(0);
             }
             _ => bail!("不明な引数: {k}"),
         }
     }
+    if let Some(place) = a.place.clone() {
+        let p = if a.gml.is_empty() && a.obj.is_empty() {
+            // 入力が無ければ PLATEAU から取得（--data-dir に該当メッシュがあればそれを使う）
+            let r = plateau_fetch::prepare(&place, a.radius, &a.data_dir, &mut |m| info!("{m}"))?;
+            a.gml.extend(r.files);
+            r.place
+        } else {
+            plateau_fetch::resolve_place(&place)?
+        };
+        a.crop = Some((p.lat, p.lon, a.radius));
+    }
     if a.gml.is_empty() && a.obj.is_empty() {
-        bail!("--gml か --obj を 1 つ以上指定してください (--help)");
+        bail!("--gml か --obj か --place（例: --place \"東京都中央区銀座4丁目\" または --place 35.67165,139.765）を指定してください (--help)");
     }
     if !a.obj.is_empty() && a.obj_origin.is_none() {
         bail!("--obj には --obj-origin 緯度,経度 が必要です");
@@ -222,6 +254,12 @@ pub struct SimState {
     acc: f32,
     heat: Vec<u32>,
     pub heat_dirty: bool,
+    /// 避難所（名前と局所座標）
+    pub shelters: Vec<(String, Vec2)>,
+    /// 進行中の避難
+    pub evac: Option<crowd::evacuation::Evacuation>,
+    /// この時刻に避難を自動で始める（--evacuate-at）
+    pub evac_at: Option<f32>,
 }
 
 /// グリッドと道路網から歩行者・車のシミュレーションを組み立てる。
@@ -276,6 +314,10 @@ struct Visuals {
     body: Handle<Mesh>,
     car_mats: Vec<Handle<StandardMaterial>>,
     glass: Handle<StandardMaterial>,
+    /// 避難中の歩行者
+    evac_mat: Handle<StandardMaterial>,
+    bus_mat: Handle<StandardMaterial>,
+    bike_mat: Handle<StandardMaterial>,
 }
 
 #[derive(Resource)]
@@ -355,7 +397,18 @@ fn main() -> Result<()> {
         acc: 0.0,
         heat,
         heat_dirty: true,
+        shelters: vec![],
+        evac: None,
+        evac_at: None,
     };
+    let mut state = state;
+    state.shelters = args
+        .shelters
+        .iter()
+        .map(|(n, lat, lon)| (n.clone(), evac::geo_to_local(&state.sim.grid, *lat, *lon)))
+        .collect();
+    state.evac_at = (!state.shelters.is_empty()).then_some(args.evacuate_at).flatten();
+    let place_ui = place::PlaceUi::new(&state.sim.grid, args.radius as f32, args.data_dir.clone());
 
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -373,6 +426,8 @@ fn main() -> Result<()> {
     })
     .insert_resource(state)
     .insert_resource(settings)
+    .insert_resource(place_ui)
+    .init_resource::<evac::EvacUi>()
     .insert_resource(UiFont(args.ui_font.clone()))
     .init_resource::<camera::UiCapture>()
     .add_plugins(bevy_egui::EguiPlugin {
@@ -383,7 +438,9 @@ fn main() -> Result<()> {
         Update,
         (
             install_ui_font,
+            evac::tools_window,
             ui::settings_panel,
+            evac::pick_shelter,
             apply_settings,
             camera::orbit_camera,
             controls,
@@ -391,6 +448,7 @@ fn main() -> Result<()> {
             sync_agents,
             sync_cars,
             signals::sync,
+            evac::sync_markers,
             update_heat,
             update_hud,
         )
@@ -590,6 +648,20 @@ fn setup(
         body,
         car_mats,
         glass,
+        evac_mat: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.10, 0.95, 0.55),
+            emissive: LinearRgba::rgb(0.0, 0.25, 0.1),
+            ..default()
+        }),
+        bus_mat: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.15, 0.55, 0.35),
+            perceptual_roughness: 0.4,
+            ..default()
+        }),
+        bike_mat: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.85, 0.85, 0.20),
+            ..default()
+        }),
     };
     spawn_entities(&mut commands, &mut meshes, &visuals, &state);
     let signal_mats = signals::SignalMats::new(&mut meshes, &mut materials);
@@ -656,12 +728,23 @@ fn spawn_entities(
         commands.spawn((
             AgentVis(i),
             Mesh3d(visuals.body.clone()),
-            MeshMaterial3d(visuals.goal_materials[a.goal].clone()),
+            MeshMaterial3d(visuals.agent_mat(a.goal)),
             Transform::from_translation(to_world(a.pos, 0.82)),
         ));
     }
     let Some(t) = &state.traffic else { return };
     for (i, v) in t.vehicles.iter().enumerate() {
+        match v.kind {
+            traffic::VehicleKind::Bus => {
+                spawn_bus(commands, meshes, visuals, i, v);
+                continue;
+            }
+            traffic::VehicleKind::Bicycle => {
+                spawn_bicycle(commands, meshes, visuals, i, v);
+                continue;
+            }
+            _ => {}
+        }
         let truck = v.length > 6.0;
         let (body_h, cabin) = if truck {
             (2.6, (1.8, 2.3, v.length * 0.5 - 0.9)) // 荷台の前に運転台
@@ -701,6 +784,77 @@ fn spawn_entities(
                 ));
             });
     }
+}
+
+impl Visuals {
+    fn agent_mat(&self, goal: usize) -> Handle<StandardMaterial> {
+        self.goal_materials
+            .get(goal)
+            .unwrap_or(&self.evac_mat)
+            .clone()
+    }
+}
+
+/// バス: 低床の長い車体に窓の帯。
+fn spawn_bus(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    visuals: &Visuals,
+    i: usize,
+    v: &traffic::Vehicle,
+) {
+    commands
+        .spawn((
+            CarVis(i),
+            Transform::from_translation(to_world(v.pos, 0.0)),
+            Visibility::Inherited,
+        ))
+        .with_children(|c| {
+            c.spawn((
+                Mesh3d(meshes.add(Cuboid::new(v.length, 2.6, v.width))),
+                MeshMaterial3d(visuals.bus_mat.clone()),
+                Transform::from_xyz(0.0, 0.3 + 1.3, 0.0),
+            ));
+            c.spawn((
+                Mesh3d(meshes.add(Cuboid::new(v.length - 0.6, 0.8, v.width + 0.04))),
+                MeshMaterial3d(visuals.glass.clone()),
+                Transform::from_xyz(0.1, 0.3 + 1.9, 0.0),
+            ));
+            // 前面ガラス
+            c.spawn((
+                Mesh3d(meshes.add(Cuboid::new(0.06, 1.3, v.width * 0.9))),
+                MeshMaterial3d(visuals.glass.clone()),
+                Transform::from_xyz(v.length * 0.5, 0.3 + 1.6, 0.0),
+            ));
+        });
+}
+
+/// 自転車: 細い車体と乗っている人。
+fn spawn_bicycle(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    visuals: &Visuals,
+    i: usize,
+    v: &traffic::Vehicle,
+) {
+    commands
+        .spawn((
+            CarVis(i),
+            Transform::from_translation(to_world(v.pos, 0.0)),
+            Visibility::Inherited,
+        ))
+        .with_children(|c| {
+            c.spawn((
+                Mesh3d(meshes.add(Cuboid::new(v.length, 0.7, 0.12))),
+                MeshMaterial3d(visuals.car_mats[1].clone()),
+                Transform::from_xyz(0.0, 0.35, 0.0),
+            ));
+            c.spawn((
+                Mesh3d(meshes.add(Capsule3d::new(0.2, 0.7))),
+                MeshMaterial3d(visuals.bike_mat.clone()),
+                Transform::from_xyz(-0.1, 1.25, 0.0),
+            ));
+        });
 }
 
 #[derive(Resource)]
@@ -743,6 +897,8 @@ fn apply_settings(
             st.sim = sim;
             st.traffic = traffic;
             st.goal_cells = goal_cells;
+            st.evac = None;
+            st.evac_at = None;
         }
         Err(e) => {
             error!("作り直しに失敗: {e:#}");
@@ -867,6 +1023,7 @@ fn advance(st: &mut SimState) {
             }
         }
         st.sim.step(DT);
+        evac::advance(st);
         for a in st.sim.agents.iter() {
             if !a.arrived {
                 if let Some((x, y)) = st.sim.grid.cell_of(a.pos) {
@@ -876,7 +1033,7 @@ fn advance(st: &mut SimState) {
             }
         }
         st.heat_dirty = true;
-        if st.respawn {
+        if st.respawn && st.evac.is_none() {
             respawn_arrived(st);
         }
     }
@@ -934,8 +1091,9 @@ fn sync_agents(
             *vis = want;
         }
         tf.translation = to_world(a.pos, 0.82);
-        if mat.0 != visuals.goal_materials[a.goal] {
-            mat.0 = visuals.goal_materials[a.goal].clone();
+        let want = visuals.agent_mat(a.goal);
+        if mat.0 != want {
+            mat.0 = want;
         }
     }
 }
