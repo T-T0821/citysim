@@ -665,7 +665,7 @@ fn simulate(
     let total = n_initial + spawner.as_ref().map_or(0, |sp| sp.total_spawned() as usize);
     let arrived = total - sim.active();
     eprintln!(
-        "完了: t={:.1}s, 到着 {}/{} 人{}, 計算 {:.2?} ({:.1}x 実時間)",
+        "完了: t={:.1}s, 到着 {}/{} 人{}, 計算 {:.2?} ({:.1}x 実時間, {:.0} ステップ/秒)",
         sim.time,
         arrived,
         total,
@@ -675,7 +675,8 @@ fn simulate(
             sp.backlog()
         )),
         t_sim.elapsed(),
-        sim.time / t_sim.elapsed().as_secs_f32()
+        sim.time / t_sim.elapsed().as_secs_f32(),
+        sim.time / args.dt / t_sim.elapsed().as_secs_f32()
     );
     if let Some(ev) = &evac {
         let fmt = |t: Option<f32>| t.map_or("未完了".to_string(), |t| format!("{t:.0} 秒"));
