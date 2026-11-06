@@ -24,8 +24,11 @@ debug = false
 [profile.dev.package."*"]
 opt-level = 2
 
-# Web 版（scripts/build-web.sh）: シミュレーションの速さを優先しつつ LTO でサイズを縮める
+# Web 版（scripts/build-web.sh）: 配信サイズを縮める。
+# シミュレーション本体（ワークスペースのクレート）は速さ優先の opt-level 3 のまま、依存クレート（bevy など）はサイズ優先
 [profile.web]
 inherits = "release"
 lto = "thin"
 codegen-units = 1
+[profile.web.package."*"]
+opt-level = "s"

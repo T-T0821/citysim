@@ -123,6 +123,35 @@ cargo run --release -p plateau-crowd-viewer -- --obj data/shibuya --obj-origin 3
 
 出典: 国土交通省 Project PLATEAU 3D 都市モデル（渋谷区）を加工して作成（[PLATEAU サイトポリシー](https://www.mlit.go.jp/plateau/site-policy/)、CC BY 4.0 互換）。
 
+## Web デモ（ブラウザ版）
+
+https://t-t0821.github.io/citysim/ でビューアをそのままブラウザで動かせます（WebGL2, PC のブラウザ向け）。
+銀座 4 丁目交差点の CityGML（`testdata/ginza`）、シナリオ例 `scenarios/ginza-evening.toml`、日本語フォント（Noto Sans JP のサブセット, SIL OFL 1.1）を wasm に同梱しています。
+main に push すると `.github/workflows/pages.yml` がビルドして GitHub Pages に公開します。
+
+URL のクエリで初期設定を変えられます（設定パネルでも変更可）。
+
+| クエリ | 例 | 意味 |
+|---|---|---|
+| `agents` / `vehicles` | `?agents=1500&vehicles=40` | 歩行者数・車両数（既定 1000 / 40） |
+| `signals` | `?signals=scramble` | `auto` / `concurrent` / `exclusive` / `scramble` / `off` |
+| `cycle` `seed` `speed` `cell` `radius` | `?radius=150` | ネイティブ版の同名オプションと同じ（`radius` は 250m まで） |
+| `scenario` | `?scenario=ginza-evening` | 同梱のシナリオを読み込む |
+| `shelter` `evacuate-at` | `?shelter=35.6712,139.7642,公園&evacuate-at=30` | 避難所と避難開始時刻 |
+| `no-respawn` | `?no-respawn` | 到着した人を再投入しない |
+
+ブラウザでは場所の自動取得（`--place`）・ファイルの保存・書き出しは使えません（ネイティブ版で使ってください）。
+シミュレーションはシングルスレッドで動くので、重いときは人数を減らしてください。
+
+手元でビルドする:
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.130   # Cargo.lock の wasm-bindgen と同じ版
+scripts/build-web.sh dist                          # wasm-opt（binaryen）があればサイズを縮める
+python3 -m http.server -d dist 8080                # → http://localhost:8080/
+```
+
 ## 3D ビューア
 
 ```sh

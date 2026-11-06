@@ -19,6 +19,8 @@ Zenn / Qiita の編集画面で同じ名前のファイルをアップロード�
 
 リポジトリ: https://github.com/T-T0821/citysim
 
+ブラウザで試す（Web デモ）: https://t-t0821.github.io/citysim/
+
 できること:
 
 - PLATEAU の CityGML（建物 `bldg` と道路 `tran`）、または PLATEAU SDK for Unity が書き出す OBJ を読む

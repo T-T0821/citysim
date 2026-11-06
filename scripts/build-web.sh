@@ -14,7 +14,7 @@ mkdir -p "$OUT"
 wasm-bindgen --target web --no-typescript --out-dir "$OUT" \
     target/wasm32-unknown-unknown/web/plateau-crowd-viewer.wasm
 if command -v wasm-opt >/dev/null; then
-    wasm-opt -O3 --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext \
+    wasm-opt -Os --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext \
         --enable-mutable-globals --enable-reference-types \
         "$OUT/plateau-crowd-viewer_bg.wasm" -o "$OUT/plateau-crowd-viewer_bg.wasm"
 fi
