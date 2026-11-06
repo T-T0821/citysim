@@ -10,6 +10,8 @@ mod geometry;
 mod scenario;
 mod signals;
 mod ui;
+#[cfg(target_arch = "wasm32")]
+mod web;
 
 use anyhow::{bail, Context, Result};
 use bevy::prelude::*;
@@ -80,7 +82,11 @@ fn parse_args() -> Result<Args> {
         respawn: true,
         screenshot: None,
     };
+    #[cfg(not(target_arch = "wasm32"))]
     let mut it = std::env::args().skip(1);
+    // Web 版は URL のクエリ（?agents=800&signals=scramble など）から
+    #[cfg(target_arch = "wasm32")]
+    let mut it = web::args().into_iter();
     while let Some(k) = it.next() {
         let mut v = || it.next().with_context(|| format!("{k} に値がありません"));
         match k.as_str() {
@@ -201,22 +207,34 @@ fn parse_args() -> Result<Args> {
             _ => bail!("不明な引数: {k}"),
         }
     }
-    if let Some(place) = a.place.clone() {
-        let p = if a.gml.is_empty() && a.obj.is_empty() {
-            // 入力が無ければ PLATEAU から取得（--data-dir に該当メッシュがあればそれを使う）
-            let r = plateau_fetch::prepare(&place, a.radius, &a.data_dir, &mut |m| info!("{m}"))?;
-            a.gml.extend(r.files);
-            r.place
-        } else {
-            plateau_fetch::resolve_place(&place)?
-        };
-        a.crop = Some((p.lat, p.lon, a.radius));
+    #[cfg(target_arch = "wasm32")]
+    {
+        if a.place.is_some() {
+            bail!("Web 版では場所を指定できません（同梱の銀座 4 丁目交差点のみ）");
+        }
+        // 入力は同梱の銀座 4 丁目交差点（load_model で読む）
+        let (lat, lon) = web::CENTER;
+        a.crop = Some((lat, lon, a.radius.clamp(50.0, web::MAX_RADIUS)));
     }
-    if a.gml.is_empty() && a.obj.is_empty() {
-        bail!("--gml か --obj か --place（例: --place \"東京都中央区銀座4丁目\" または --place 35.67165,139.765）を指定してください (--help)");
-    }
-    if !a.obj.is_empty() && a.obj_origin.is_none() {
-        bail!("--obj には --obj-origin 緯度,経度 が必要です");
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if let Some(place) = a.place.clone() {
+            let p = if a.gml.is_empty() && a.obj.is_empty() {
+                // 入力が無ければ PLATEAU から取得（--data-dir に該当メッシュがあればそれを使う）
+                let r = plateau_fetch::prepare(&place, a.radius, &a.data_dir, &mut |m| info!("{m}"))?;
+                a.gml.extend(r.files);
+                r.place
+            } else {
+                plateau_fetch::resolve_place(&place)?
+            };
+            a.crop = Some((p.lat, p.lon, a.radius));
+        }
+        if a.gml.is_empty() && a.obj.is_empty() {
+            bail!("--gml か --obj か --place（例: --place \"東京都中央区銀座4丁目\" または --place 35.67165,139.765）を指定してください (--help)");
+        }
+        if !a.obj.is_empty() && a.obj_origin.is_none() {
+            bail!("--obj には --obj-origin 緯度,経度 が必要です");
+        }
     }
     Ok(a)
 }
@@ -235,6 +253,10 @@ fn parse_pair(s: &str) -> Result<(f64, f64)> {
 /// 入力ファイルを読み、必要なら範囲を切り出す。戻り値はモデルとグリッド化する範囲。
 fn load_model(args: &Args) -> Result<(plateau_gml::CityModel, Option<(f64, f64, f64, f64)>)> {
     let mut model = plateau_gml::CityModel::default();
+    #[cfg(target_arch = "wasm32")]
+    for s in web::GML {
+        model.merge(plateau_gml::parse_str(s)?);
+    }
     for p in &args.gml {
         model.merge(plateau_gml::parse_file(p)?);
     }
@@ -376,6 +398,7 @@ pub struct HeatOverlay;
 struct CarVis(usize);
 
 #[derive(Resource)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 struct RecordPlan {
     dir: PathBuf,
     frames: u32,
@@ -392,7 +415,20 @@ const RECORD_WARMUP: u32 = 15;
 #[derive(Component)]
 struct Hud;
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> Result<()> {
+    run()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    if let Err(e) = run() {
+        error!("{e:#}");
+        web::show_error(&format!("{e:#}"));
+    }
+}
+
+fn run() -> Result<()> {
     let args = parse_args()?;
     let (model, bounds) = load_model(&args)?;
     info!(
@@ -468,6 +504,9 @@ fn main() -> Result<()> {
         primary_window: Some(Window {
             title: "PLATEAU crowd simulator".into(),
             resolution: (1280.0_f32, 800.0_f32).into(),
+            // Web 版: index.html の <canvas id="bevy"> にページいっぱいで描く
+            canvas: cfg!(target_arch = "wasm32").then(|| "#bevy".into()),
+            fit_canvas_to_parent: true,
             ..default()
         }),
         ..default()
@@ -512,6 +551,7 @@ fn main() -> Result<()> {
         )
             .chain(),
     );
+    #[cfg(not(target_arch = "wasm32"))]
     if let Some((dir, secs)) = args.record {
         std::fs::create_dir_all(&dir)?;
         app.insert_resource(RecordPlan {
@@ -1314,6 +1354,7 @@ fn take_screenshot(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn record_frames(
     mut commands: Commands,
     mut plan: ResMut<RecordPlan>,

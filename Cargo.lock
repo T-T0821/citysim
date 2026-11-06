@@ -3633,10 +3633,12 @@ dependencies = [
  "bevy",
  "bevy_egui",
  "crowd",
+ "js-sys",
  "plateau-fetch",
  "plateau-gml",
  "traffic",
  "walkmap",
+ "web-sys",
 ]
 
 [[package]]
