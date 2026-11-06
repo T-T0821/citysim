@@ -56,6 +56,8 @@ pub struct Simulation {
     pub agents: Vec<Agent>,
     pub params: Params,
     pub time: f32,
+    /// 動く障害物（車両など）: カプセルの端点 2 つと半径。毎ステップ外から更新する。
+    pub obstacles: Vec<(Vec2, Vec2, f32)>,
     hash: SpatialHash,
 }
 
@@ -68,6 +70,7 @@ impl Simulation {
             agents: vec![],
             params,
             time: 0.0,
+            obstacles: vec![],
             hash,
         }
     }
@@ -121,6 +124,22 @@ impl Simulation {
                 if overlap > 0.0 {
                     f += nw * (p.k_body * overlap);
                 }
+            }
+            // 車両など動く障害物（壁より強く、少し遠くから避ける）
+            for &(oa, ob, r) in &self.obstacles {
+                let ab = ob - oa;
+                let t = ((a.pos - oa).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+                let d = a.pos - (oa + ab * t);
+                let dist = d.length();
+                if dist > r + 3.0 {
+                    continue;
+                }
+                let Some(n) = d.try_normalize() else { continue };
+                let overlap = a.radius + r - dist;
+                let mag =
+                    p.a_wall * 2.0 * (overlap / 0.5).exp() + p.k_body * 2.0 * overlap.max(0.0);
+                // 押し付けられて壁際で動けなくならないよう上限を設ける
+                f += n * mag.min(40.0);
             }
             acc[i] = f;
         }
@@ -242,7 +261,7 @@ mod tests {
         let mut sim = Simulation::new(g, vec![ff], Params::default());
         let mut rng = Rng::new(7);
         while sim.agents.len() < 40 {
-            let p = Vec2::new(rng.range(1.0, 10.0), rng.range(49.0, 71.0));
+            let p = Vec2::new(rng.range(1.0, 10.0), rng.range(61.0, 79.0));
             if sim.grid.obstacle_sample(p).0 > 0.4 {
                 sim.agents.push(Agent {
                     pos: p,
@@ -254,13 +273,13 @@ mod tests {
                 });
             }
         }
-        for _ in 0..(200.0 / 0.05) as usize {
+        for _ in 0..(300.0 / 0.05) as usize {
             sim.step(0.05);
             if sim.active() == 0 {
                 break;
             }
         }
-        assert_eq!(sim.active(), 0, "全員が 200 秒以内に到着すること");
+        assert_eq!(sim.active(), 0, "全員が 300 秒以内に到着すること");
         assert!(sim.agents.iter().all(|a| sim.grid.is_walkable(a.pos)));
     }
 }

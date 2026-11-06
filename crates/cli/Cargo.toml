@@ -14,3 +14,4 @@ glam.workspace = true
 plateau-gml.workspace = true
 walkmap.workspace = true
 crowd.workspace = true
+traffic.workspace = true

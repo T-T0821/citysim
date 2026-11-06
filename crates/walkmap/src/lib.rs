@@ -54,6 +54,12 @@ pub struct WalkGrid {
     pub obstacle_dist: Vec<f32>,
     pub projection: LocalProjection,
     pub buildings: Vec<(Polygon, f32)>,
+    /// 道路面データから歩行空間を作ったか
+    pub has_roads: bool,
+    /// 車道セル（`mark_carriageway` で設定。未設定なら空）
+    pub carriageway: Vec<bool>,
+    /// 歩行者の経路コスト倍率（車道は高くして歩道を優先させる）
+    pub walk_cost: Vec<f32>,
 }
 
 impl WalkGrid {
@@ -95,9 +101,32 @@ impl WalkGrid {
             obstacle_dist: vec![],
             projection: proj,
             buildings,
+            has_roads: !roads.is_empty(),
+            carriageway: vec![],
+            walk_cost: vec![1.0; w * h],
         };
         g.obstacle_dist = g.chamfer_obstacle_distance();
         Some(g)
+    }
+
+    /// 道路の端（建物・道路外）から `sidewalk_w` [m] 以上離れた歩行可能セルを車道とみなす。
+    /// PLATEAU LOD1 の道路面は歩道と車道を区別しないための近似（LOD2 以降は TrafficArea で区別できる）。
+    /// 歩行者が車道を通るコストは `crossing_cost` 倍になる。
+    pub fn mark_carriageway(&mut self, sidewalk_w: f32, crossing_cost: f32) {
+        self.carriageway = (0..self.w * self.h)
+            .map(|i| self.walkable[i] && self.obstacle_dist[i] >= sidewalk_w)
+            .collect();
+        for (c, &cw) in self.walk_cost.iter_mut().zip(&self.carriageway) {
+            *c = if cw { crossing_cost } else { 1.0 };
+        }
+    }
+
+    pub fn is_carriageway(&self, p: Vec2) -> bool {
+        !self.carriageway.is_empty()
+            && self
+                .cell_of(p)
+                .map(|(x, y)| self.carriageway[self.idx(x, y)])
+                .unwrap_or(false)
     }
 
     #[inline]
@@ -268,7 +297,7 @@ impl FlowField {
                     continue;
                 }
                 let wall_pen = 1.0 + 2.0 * (-grid.obstacle_dist[j] / 1.0).exp();
-                let nd = d + len * grid.cell * wall_pen;
+                let nd = d + len * grid.cell * wall_pen * grid.walk_cost[j];
                 if nd < dist[j] {
                     dist[j] = nd;
                     heap.push(Node(nd, j));
@@ -382,11 +411,11 @@ mod tests {
     #[test]
     fn grid_matches_sample_layout() {
         let g = sample();
-        assert!((119..=121).contains(&g.w), "w={}", g.w);
-        // 十字路の中央付近は歩ける、建物の中・道路外は歩けない
-        assert!(g.is_walkable(Vec2::new(52.0, 60.0)));
-        assert!(!g.is_walkable(Vec2::new(60.0, 60.0))); // 中央の小建物
-        assert!(!g.is_walkable(Vec2::new(20.0, 20.0)));
+        assert!((199..=201).contains(&g.w), "w={}", g.w);
+        // 道路上は歩ける、街区（建物・道路外）は歩けない
+        assert!(g.is_walkable(Vec2::new(70.0, 30.0)));
+        assert!(g.is_walkable(Vec2::new(70.0, 70.0))); // 交差点
+        assert!(!g.is_walkable(Vec2::new(30.0, 30.0)));
     }
 
     #[test]
@@ -394,7 +423,7 @@ mod tests {
         let g = sample();
         let goals: Vec<_> = g.walkable_cells().filter(|&(x, _)| x + 2 >= g.w).collect();
         let ff = FlowField::compute(&g, &goals);
-        let start = Vec2::new(2.0, 60.0);
+        let start = Vec2::new(2.0, 70.0);
         assert!(ff.distance(&g, start).is_finite());
         let d = ff.direction(&g, start).unwrap();
         assert!(d.x > 0.5, "{d:?}");

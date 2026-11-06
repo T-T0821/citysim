@@ -8,24 +8,30 @@ Project PLATEAU（国交省 3D 都市モデル, CityGML）上で歩行者の流�
 crates/
   plateau-gml/  CityGML (bldg / tran) のストリーミングパーサ（quick-xml）
   walkmap/      緯度経度→局所平面、歩行可能グリッド、フローフィールド、障害物距離場
-  crowd/        Social Force Model によるエージェント計算
+  crowd/        Social Force Model による歩行者の計算
+  traffic/      車道の中心線ネットワーク抽出と車両の計算（IDM・左側通行・交差点制御）
   cli/          ヘッドレス実行。軌跡 CSV と通行量ヒートマップ PNG を出力
   viewer/       bevy 0.16 による 3D ビューア（建物の押し出し表示 + 歩行者 + ヒートマップ）
-testdata/       合成テストデータ（東京駅付近 120m 四方の十字路と 5 棟）
+testdata/       合成テストデータ（東京駅付近 200m 四方、幅 20m の「井」の字の道路と 15 棟）
 ```
 
 処理の流れ:
 
 1. **読込**: `bldg:Building` の LOD0 フットプリント（無ければ LOD1 立体の底面）と `tran:Road` の LOD1 路面を取得。座標は EPSG:6697（緯度・経度・楕円体高）。
-2. **歩行空間**: 道路面があれば「道路 ∖ 建物」、無ければ「範囲 ∖ 建物」を 0.5m グリッドに塗る。
+2. **歩行空間**: 道路面があれば「道路 ∖ 建物」、無ければ「範囲 ∖ 建物」を 0.5m グリッドに塗る。道路の端から 3m を歩道、それより内側を車道とみなす（LOD1 の道路面は歩道と車道を区別しないための近似）。
 3. **経路誘導**: 目的地ごとに 8 近傍 Dijkstra で距離場（フローフィールド）を作る。壁際はコスト増。
-4. **歩行者モデル**: 駆動力 + 他者反発（視野異方性つき）+ 壁反発 + 接触力。近傍探索は空間ハッシュ。
-5. **出力**: `t,id,lat,lon,x,y,vx,vy` の CSV（kepler.gl / QGIS / deck.gl でそのまま可視化可）と PNG。
+4. **歩行者モデル**: 駆動力 + 他者反発（視野異方性つき）+ 壁反発 + 車からの反発 + 接触力。近傍探索は空間ハッシュ。車道の通行コストを 6 倍にして、歩道を歩き車道は短く横断するようにしている。
+5. **車両モデル**:
+   - 車道を Zhang–Suen 法で細線化して中心線を取り出し、交差点ノードと道路区間のグラフにする。範囲の縁で途切れる道路は出入口になる。
+   - 左側通行で中心線から 1.8m ずらして走る。縦方向は Intelligent Driver Model（前の車・停止線・前方の歩行者に追従）。
+   - 交差点は「動線（進入レーン→退出レーン）」単位の通行権で制御する。軌跡が交わらない動線（対向の直進同士など）は同時に通れ、待ち車がいれば 6 秒で交代。出口側が詰まっていれば交差点に入らない。
+   - 歩行者が前にいれば止まり、5 秒以上にらみ合ったら徐行で進む。縁に着いた車は別の出入口から再投入する。
+6. **出力**: `t,kind,id,lat,lon,x,y,vx,vy` の CSV（kind は `ped` / `car`）（kepler.gl / QGIS / deck.gl でそのまま可視化可）と PNG。
 
 ## 使い方
 
 ```sh
-cargo run --release -- --gml testdata/sample.gml --agents 400 --duration 300 \
+cargo run --release -- --gml testdata/sample.gml --agents 400 --vehicles 30 --duration 300 \
     --csv out.csv --png heatmap.png
 
 # PLATEAU の 3 次メッシュ単位の GML を複数／ディレクトリで渡せる
@@ -36,7 +42,7 @@ cargo run --release -- --gml udx/bldg/53394611_bldg_6697_op.gml \
 ## 3D ビューア
 
 ```sh
-cargo run --release -p plateau-crowd-viewer -- --gml testdata/sample.gml --agents 600
+cargo run --release -p plateau-crowd-viewer -- --gml testdata/sample.gml --agents 600 --vehicles 30
 ```
 
 | 操作 | 内容 |
@@ -46,12 +52,14 @@ cargo run --release -p plateau-crowd-viewer -- --gml testdata/sample.gml --agent
 | ↑ / ↓ | 再生速度 ×2 / ×½ |
 | H | 通行量ヒートマップの表示切替 |
 
-歩行者は目的地（東西南北の縁）ごとに色分けされ、到着すると別の縁から再投入されます（`--no-respawn` で無効）。
-`--screenshot out.png 60` でシミュレーション 60 秒時点の画面を保存して終了します（`PLATEAU_SHOW_HEAT=1` でヒートマップ付き）。
+歩行者は目的地（東西南北の縁）ごとに色分けされ、車は乗用車（4.5m）とトラック（7.5m、1 割）が走ります。歩行者は到着すると別の縁から再投入されます（`--no-respawn` で無効）。
+`--screenshot out.png 60` でシミュレーション 60 秒時点の画面を保存して終了します（`PLATEAU_SHOW_HEAT=1` でヒートマップ付き、`PLATEAU_CAM="yaw,pitch,距離,x,y"` でカメラ位置指定）。
 
 Linux では `libxkbcommon-x11-0` と Vulkan ドライバ（GPU のもの、または `mesa-vulkan-drivers`）が必要です。
 
 ![viewer](docs/viewer.png)
+
+![cars](docs/viewer-cars.png)
 
 ## ロードマップ
 
@@ -62,4 +70,6 @@ Linux では `libxkbcommon-x11-0` と Vulkan ドライバ（GPU のもの、ま�
 - [ ] 可視化の拡張: LOD2 の屋根形状・テクスチャ、地形 (dem)、wasm + WebGPU でブラウザ表示
 - [ ] 速度向上: rayon による並列化、密度に応じた計算（数万人規模）
 - [ ] 評価指標: 密度（人/m²）、流量、サービス水準 (LOS)、避難完了時間
-- [ ] 歩道 (`tran:TrafficArea` の function)、横断歩道、階段・建物入口の扱い
+- [x] 車両: 道路網抽出、IDM、交差点の通行権、歩行者との相互作用
+- [ ] 信号機・横断歩道、車線数（多車線・右左折レーン）、駐車・路線バス
+- [ ] 歩道 (`tran:TrafficArea` の function) による正確な歩道／車道の区別、階段・建物入口の扱い

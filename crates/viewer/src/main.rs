@@ -1,4 +1,4 @@
-//! plateau-crowd-viewer: PLATEAU の建物を 3D 表示し、その上で歩行者をリアルタイムに動かす。
+//! plateau-crowd-viewer: PLATEAU の建物を 3D 表示し、その上で歩行者と車をリアルタイムに動かす。
 //!
 //! 操作: 左ドラッグ=回転 / 右ドラッグ=平行移動 / ホイール=ズーム
 //!       Space=一時停止 / ↑↓=再生速度 / H=ヒートマップ表示切替
@@ -10,8 +10,9 @@ use anyhow::{bail, Context, Result};
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use crowd::{Rng, Simulation};
-use geometry::{to_world, walkable_surface, MeshBuilder};
+use geometry::{dashed_line, to_world, walkable_surface, MeshBuilder};
 use std::path::PathBuf;
+use traffic::{RoadGraph, Traffic};
 use walkmap::WalkGrid;
 
 const DT: f32 = 0.05;
@@ -19,6 +20,7 @@ const DT: f32 = 0.05;
 struct Args {
     gml: Vec<PathBuf>,
     agents: usize,
+    vehicles: usize,
     cell: f32,
     seed: u64,
     respawn: bool,
@@ -29,6 +31,7 @@ fn parse_args() -> Result<Args> {
     let mut a = Args {
         gml: vec![],
         agents: 1000,
+        vehicles: 40,
         cell: 0.5,
         seed: 1,
         respawn: true,
@@ -52,6 +55,7 @@ fn parse_args() -> Result<Args> {
                 }
             }
             "--agents" => a.agents = v()?.parse()?,
+            "--vehicles" => a.vehicles = v()?.parse()?,
             "--cell" => a.cell = v()?.parse()?,
             "--seed" => a.seed = v()?.parse()?,
             "--no-respawn" => a.respawn = false,
@@ -63,7 +67,7 @@ fn parse_args() -> Result<Args> {
             }
             "-h" | "--help" => {
                 println!(
-                    "usage: plateau-crowd-viewer --gml <file|dir>... [--agents N] [--cell M] [--seed N]\n\
+                    "usage: plateau-crowd-viewer --gml <file|dir>... [--agents N] [--vehicles N] [--cell M] [--seed N]\n\
                      \x20                          [--no-respawn] [--screenshot out.png <sim秒>]"
                 );
                 std::process::exit(0);
@@ -80,6 +84,7 @@ fn parse_args() -> Result<Args> {
 #[derive(Resource)]
 struct SimState {
     sim: Simulation,
+    traffic: Option<Traffic>,
     rng: Rng,
     /// 目的地ごとの到着セル（再出現位置に使う）
     goal_cells: Vec<Vec<(usize, usize)>>,
@@ -111,6 +116,9 @@ struct AgentVis(usize);
 struct HeatOverlay;
 
 #[derive(Component)]
+struct CarVis(usize);
+
+#[derive(Component)]
 struct Hud;
 
 fn main() -> Result<()> {
@@ -125,6 +133,15 @@ fn main() -> Result<()> {
         model.roads().count()
     );
     let grid = WalkGrid::from_city(&model, args.cell).context("座標を含む地物がありません")?;
+    let traffic = (args.vehicles > 0 && grid.has_roads).then(|| {
+        let net = RoadGraph::from_grid(&grid, crowd::scenario::SIDEWALK_W);
+        info!(
+            "道路網: ノード {}, 区間 {}",
+            net.nodes.len(),
+            net.edges.len()
+        );
+        Traffic::new(net, args.vehicles, args.seed)
+    });
     let (sim, names) = crowd::scenario::through_traffic(grid, args.agents, args.seed)
         .context("範囲の縁に歩行可能領域がありません")?;
     info!("目的地 {:?}, エージェント {} 人", names, sim.agents.len());
@@ -142,6 +159,7 @@ fn main() -> Result<()> {
     let heat = vec![0; sim.grid.w * sim.grid.h];
     let state = SimState {
         sim,
+        traffic,
         rng: Rng::new(args.seed ^ 0x9E37_79B9),
         goal_cells,
         respawn: args.respawn,
@@ -175,6 +193,7 @@ fn main() -> Result<()> {
             controls,
             step_sim,
             sync_agents,
+            sync_cars,
             update_heat,
             update_hud,
         )
@@ -213,17 +232,114 @@ fn setup(
         })),
         Transform::from_translation(to_world(center, -0.05)),
     ));
-    // 歩行可能面
-    let walk = walkable_surface(g, 0.0);
-    if !walk.is_empty() {
+    // 歩道（明るい灰）と車道（アスファルト）
+    let is_road = |i: usize| !g.carriageway.is_empty() && g.carriageway[i];
+    let surfaces = [
+        (
+            walkable_surface(g, 0.0, |i| !is_road(i)),
+            Color::srgb(0.78, 0.78, 0.76),
+        ),
+        (
+            walkable_surface(g, 0.0, is_road),
+            Color::srgb(0.24, 0.25, 0.27),
+        ),
+    ];
+    for (mb, color) in surfaces {
+        if mb.is_empty() {
+            continue;
+        }
         commands.spawn((
-            Mesh3d(meshes.add(walk.build())),
+            Mesh3d(meshes.add(mb.build())),
             MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: Color::srgb(0.78, 0.78, 0.76),
+                base_color: color,
                 perceptual_roughness: 0.95,
                 ..default()
             })),
         ));
+    }
+    // センターライン（交差点内は描かない）
+    if let Some(t) = &state.traffic {
+        let mut lines = MeshBuilder::default();
+        for e in &t.graph.edges {
+            let trim = (
+                t.graph.nodes[e.a].radius + 1.0,
+                t.graph.nodes[e.b].radius + 1.0,
+            );
+            dashed_line(&mut lines, &e.pts, 0.15, 3.0, 3.0, trim, 0.01);
+        }
+        if !lines.is_empty() {
+            commands.spawn((
+                Mesh3d(meshes.add(lines.build())),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: Color::srgb(0.95, 0.95, 0.92),
+                    unlit: true,
+                    ..default()
+                })),
+            ));
+        }
+        // 車: 車体 + 客室の 2 つの箱
+        let car_colors = [
+            Color::srgb(0.95, 0.95, 0.95),
+            Color::srgb(0.12, 0.12, 0.14),
+            Color::srgb(0.65, 0.67, 0.70),
+            Color::srgb(0.70, 0.10, 0.12),
+            Color::srgb(0.10, 0.25, 0.55),
+            Color::srgb(0.85, 0.75, 0.20),
+        ];
+        let car_mats: Vec<_> = car_colors
+            .iter()
+            .map(|&c| {
+                materials.add(StandardMaterial {
+                    base_color: c,
+                    perceptual_roughness: 0.35,
+                    metallic: 0.3,
+                    ..default()
+                })
+            })
+            .collect();
+        let glass = materials.add(StandardMaterial {
+            base_color: Color::srgb(0.10, 0.13, 0.18),
+            perceptual_roughness: 0.1,
+            ..default()
+        });
+        for (i, v) in t.vehicles.iter().enumerate() {
+            let truck = v.length > 6.0;
+            let (body_h, cabin) = if truck {
+                (2.6, (1.8, 2.3, v.length * 0.5 - 0.9)) // 荷台の前に運転台
+            } else {
+                (0.75, (v.length * 0.5, 0.6, -0.2))
+            };
+            commands
+                .spawn((
+                    CarVis(i),
+                    Transform::from_translation(to_world(v.pos, 0.0)),
+                    Visibility::Inherited,
+                ))
+                .with_children(|c| {
+                    let body_len = if truck { v.length - 2.0 } else { v.length };
+                    let body_x = if truck { -1.0 } else { 0.0 };
+                    c.spawn((
+                        Mesh3d(meshes.add(Cuboid::new(body_len, body_h, v.width))),
+                        MeshMaterial3d(car_mats[v.style as usize % car_mats.len()].clone()),
+                        Transform::from_xyz(body_x, 0.3 + body_h * 0.5, 0.0),
+                    ));
+                    let (cl, ch, cx) = cabin;
+                    let cy = if truck {
+                        0.3 + ch * 0.5
+                    } else {
+                        0.3 + body_h + ch * 0.5
+                    };
+                    c.spawn((
+                        Mesh3d(meshes.add(Cuboid::new(cl, ch, v.width * 0.92))),
+                        MeshMaterial3d(if truck {
+                            car_mats[0].clone()
+                        } else {
+                            glass.clone()
+                        }),
+                        Transform::from_xyz(cx, cy, 0.0),
+                    ));
+                });
+        }
     }
     // 通行量ヒートマップ（歩行面のすぐ上に半透明で重ねる）
     let heat_image = images.add(heat_image_new(g.w as u32, g.h as u32));
@@ -309,14 +425,22 @@ fn setup(
         },
         Transform::from_xyz(-0.6, 1.0, 0.4).looking_at(Vec3::ZERO, Vec3::Y),
     ));
-    let target = to_world(center, 0.0);
-    let dist = size.max_element().max(60.0) * 1.5;
+    let mut target = to_world(center, 0.0);
+    let mut dist = size.max_element().max(60.0) * 1.5;
+    let (mut yaw, mut pitch) = (-0.6, 0.9);
+    // 確認用: PLATEAU_CAM="yaw,pitch,距離,x,y"（x,y は局所座標 [m]）でカメラ初期位置を指定
+    if let Ok(c) = std::env::var("PLATEAU_CAM") {
+        let v: Vec<f32> = c.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        if let [y, p, d, x, z] = v[..] {
+            (yaw, pitch, dist, target) = (y, p, d, to_world(Vec2::new(x, z), 0.0));
+        }
+    }
     commands.spawn((
         Camera3d::default(),
         camera::OrbitCamera {
             target,
-            yaw: -0.6,
-            pitch: 0.9,
+            yaw,
+            pitch,
             distance: dist,
         },
         Transform::default(),
@@ -401,6 +525,17 @@ fn step_sim(time: Res<Time>, mut state: ResMut<SimState>, shot: Option<Res<Scree
     };
     while budget > 0 {
         budget -= 1;
+        if let Some(t) = st.traffic.as_mut() {
+            let peds: Vec<Vec2> = st
+                .sim
+                .agents
+                .iter()
+                .filter(|a| !a.arrived)
+                .map(|a| a.pos)
+                .collect();
+            t.step(DT, &peds);
+            st.sim.obstacles = t.obstacles();
+        }
         st.sim.step(DT);
         for a in st.sim.agents.iter() {
             if !a.arrived {
@@ -473,6 +608,24 @@ fn sync_agents(
     }
 }
 
+fn sync_cars(state: Res<SimState>, mut q: Query<(&CarVis, &mut Transform, &mut Visibility)>) {
+    let Some(t) = &state.traffic else { return };
+    for (CarVis(i), mut tf, mut vis) in &mut q {
+        let v = &t.vehicles[*i];
+        let want = if v.active {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        if *vis != want {
+            *vis = want;
+        }
+        tf.translation = to_world(v.pos, 0.0);
+        // 平面の (x, y) → (x, -z) なので、Y 軸回りに atan2(y, x) 回すと +X が進行方向を向く
+        tf.rotation = Quat::from_rotation_y(v.heading.y.atan2(v.heading.x));
+    }
+}
+
 fn update_heat(
     mut state: ResMut<SimState>,
     visuals: Res<Visuals>,
@@ -517,11 +670,12 @@ fn update_hud(state: Res<SimState>, mut q: Query<&mut Text, With<Hud>>) {
     let active = state.sim.active();
     for mut t in &mut q {
         **t = format!(
-            "t = {:6.1} s   walking {}/{}   speed x{}{}\n\
+            "t = {:6.1} s   walking {}/{}   cars {}   speed x{}{}\n\
              LMB rotate / RMB pan / wheel zoom   [Space] pause  [Up/Down] speed  [H] heatmap",
             state.sim.time,
             active,
             state.sim.agents.len(),
+            state.traffic.as_ref().map_or(0, |t| t.active()),
             state.speed,
             if state.paused { "  (paused)" } else { "" },
         );

@@ -2961,6 +2961,7 @@ dependencies = [
  "crowd",
  "glam",
  "plateau-gml",
+ "traffic",
  "walkmap",
 ]
 
@@ -2972,6 +2973,7 @@ dependencies = [
  "bevy",
  "crowd",
  "plateau-gml",
+ "traffic",
  "walkmap",
 ]
 
@@ -3819,6 +3821,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "traffic"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "plateau-gml",
+ "walkmap",
 ]
 
 [[package]]

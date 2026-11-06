@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/plateau-gml", "crates/walkmap", "crates/crowd", "crates/cli", "crates/viewer"]
+members = ["crates/plateau-gml", "crates/walkmap", "crates/crowd", "crates/cli", "crates/viewer", "crates/traffic"]
 
 [workspace.package]
 edition = "2021"
@@ -14,6 +14,7 @@ anyhow = "1"
 plateau-gml = { path = "crates/plateau-gml" }
 walkmap = { path = "crates/walkmap" }
 crowd = { path = "crates/crowd" }
+traffic = { path = "crates/traffic" }
 
 [profile.release]
 debug = false

@@ -89,18 +89,19 @@ impl MeshBuilder {
     }
 }
 
-/// 歩行可能セルを行ごとの連続区間にまとめて板ポリゴン化する。
-pub fn walkable_surface(grid: &WalkGrid, h: f32) -> MeshBuilder {
+/// 歩行可能セル（のうち `include` を満たすもの）を行ごとの連続区間にまとめて板ポリゴン化する。
+pub fn walkable_surface(grid: &WalkGrid, h: f32, include: impl Fn(usize) -> bool) -> MeshBuilder {
+    let on = |x: usize, y: usize| grid.walkable[grid.idx(x, y)] && include(grid.idx(x, y));
     let mut mb = MeshBuilder::default();
     for y in 0..grid.h {
         let mut x = 0;
         while x < grid.w {
-            if !grid.walkable[grid.idx(x, y)] {
+            if !on(x, y) {
                 x += 1;
                 continue;
             }
             let x0 = x;
-            while x < grid.w && grid.walkable[grid.idx(x, y)] {
+            while x < grid.w && on(x, y) {
                 x += 1;
             }
             let c = grid.cell;
@@ -118,6 +119,46 @@ pub fn walkable_surface(grid: &WalkGrid, h: f32) -> MeshBuilder {
         }
     }
     mb
+}
+
+/// 折れ線に沿った破線（センターライン）。両端 `trim` [m] は描かない。
+pub fn dashed_line(
+    mb: &mut MeshBuilder,
+    pts: &[Vec2],
+    width: f32,
+    dash: f32,
+    gap: f32,
+    trim: (f32, f32),
+    h: f32,
+) {
+    let total: f32 = pts.windows(2).map(|w| w[0].distance(w[1])).sum();
+    let mut s = trim.0;
+    while s + dash <= total - trim.1 {
+        let (a, da) = point_at(pts, s);
+        let (b, _) = point_at(pts, s + dash);
+        let n = da.perp() * (0.5 * width);
+        mb.quad(
+            to_world(a - n, h),
+            to_world(b - n, h),
+            to_world(b + n, h),
+            to_world(a + n, h),
+            Vec3::Y,
+        );
+        s += dash + gap;
+    }
+}
+
+fn point_at(pts: &[Vec2], mut s: f32) -> (Vec2, Vec2) {
+    for w in pts.windows(2) {
+        let l = w[0].distance(w[1]);
+        if s <= l || l == 0.0 {
+            let d = (w[1] - w[0]).normalize_or_zero();
+            return (w[0] + d * s.min(l), d);
+        }
+        s -= l;
+    }
+    let n = pts.len();
+    (pts[n - 1], (pts[n - 1] - pts[n - 2]).normalize_or_zero())
 }
 
 fn signed_area(p: &[Vec2]) -> f32 {

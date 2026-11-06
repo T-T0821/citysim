@@ -16,6 +16,7 @@ use walkmap::WalkGrid;
 struct Args {
     gml: Vec<PathBuf>,
     agents: usize,
+    vehicles: usize,
     cell: f32,
     duration: f32,
     dt: f32,
@@ -29,6 +30,7 @@ fn parse_args() -> Result<Args> {
     let mut a = Args {
         gml: vec![],
         agents: 300,
+        vehicles: 40,
         cell: 0.5,
         duration: 300.0,
         dt: 0.05,
@@ -55,6 +57,7 @@ fn parse_args() -> Result<Args> {
                 }
             }
             "--agents" => a.agents = v()?.parse()?,
+            "--vehicles" => a.vehicles = v()?.parse()?,
             "--cell" => a.cell = v()?.parse()?,
             "--duration" => a.duration = v()?.parse()?,
             "--dt" => a.dt = v()?.parse()?,
@@ -64,7 +67,7 @@ fn parse_args() -> Result<Args> {
             "--png" => a.png = Some(v()?.into()),
             "-h" | "--help" => {
                 println!(
-                    "usage: plateau-crowd --gml <file|dir>... [--agents N] [--cell M] [--duration S] [--dt S]\n\
+                    "usage: plateau-crowd --gml <file|dir>... [--agents N] [--vehicles N] [--cell M] [--duration S] [--dt S]\n\
                      \x20                    [--seed N] [--csv out.csv] [--csv-every S] [--png heatmap.png]"
                 );
                 std::process::exit(0);
@@ -104,15 +107,32 @@ fn main() -> Result<()> {
         100.0 * n_walk as f32 / (grid.w * grid.h) as f32
     );
 
+    let mut traffic = if args.vehicles > 0 && grid.has_roads {
+        let net = traffic::RoadGraph::from_grid(&grid, crowd::scenario::SIDEWALK_W);
+        eprintln!(
+            "道路網: 交差点 {} か所, 出入口 {} か所, 区間 {} 本",
+            net.nodes.iter().filter(|n| n.edges.len() >= 3).count(),
+            net.nodes.iter().filter(|n| n.border).count(),
+            net.edges.len()
+        );
+        Some(traffic::Traffic::new(net, args.vehicles, args.seed))
+    } else {
+        None
+    };
+
     let (mut sim, goal_names) = crowd::scenario::through_traffic(grid, args.agents, args.seed)
         .context("範囲の縁に歩行可能領域がありません")?;
     eprintln!("目的地: {}", goal_names.join(", "));
-    eprintln!("エージェント: {} 人", sim.agents.len());
+    eprintln!(
+        "歩行者: {} 人, 車両: {} 台",
+        sim.agents.len(),
+        traffic.as_ref().map_or(0, |t| t.vehicles.len())
+    );
 
     let mut csv = match &args.csv {
         Some(p) => {
             let mut f = std::io::BufWriter::new(std::fs::File::create(p)?);
-            writeln!(f, "t,id,lat,lon,x,y,vx,vy")?;
+            writeln!(f, "t,kind,id,lat,lon,x,y,vx,vy")?;
             Some(f)
         }
         None => None,
@@ -128,8 +148,20 @@ fn main() -> Result<()> {
                     let (lat, lon) = sim.grid.projection.to_geo(a.pos);
                     writeln!(
                         f,
-                        "{:.2},{i},{lat:.8},{lon:.8},{:.3},{:.3},{:.3},{:.3}",
+                        "{:.2},ped,{i},{lat:.8},{lon:.8},{:.3},{:.3},{:.3},{:.3}",
                         sim.time, a.pos.x, a.pos.y, a.vel.x, a.vel.y
+                    )?;
+                }
+                for (i, v) in traffic.iter().flat_map(|t| t.vehicles.iter().enumerate()) {
+                    if !v.active {
+                        continue;
+                    }
+                    let (lat, lon) = sim.grid.projection.to_geo(v.pos);
+                    let vel = v.heading * v.v;
+                    writeln!(
+                        f,
+                        "{:.2},car,{i},{lat:.8},{lon:.8},{:.3},{:.3},{:.3},{:.3}",
+                        sim.time, v.pos.x, v.pos.y, vel.x, vel.y
                     )?;
                 }
             }
@@ -141,6 +173,16 @@ fn main() -> Result<()> {
         }
         if s == steps || sim.active() == 0 {
             break;
+        }
+        if let Some(t) = traffic.as_mut() {
+            let peds: Vec<_> = sim
+                .agents
+                .iter()
+                .filter(|a| !a.arrived)
+                .map(|a| a.pos)
+                .collect();
+            t.step(args.dt, &peds);
+            sim.obstacles = t.obstacles();
         }
         sim.step(args.dt);
     }
