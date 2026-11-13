@@ -76,9 +76,12 @@ impl ScenarioState {
             goal_names: vec![],
             zone_size,
             diff_view: false,
-            path: path
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "scenario.toml".into()),
+            path: path.map(|p| p.display().to_string()).unwrap_or_else(|| {
+                #[cfg(target_arch = "wasm32")]
+                return crate::web::DEFAULT_SCENARIO_PATH.into();
+                #[cfg(not(target_arch = "wasm32"))]
+                return "scenario.toml".into();
+            }),
             export_dir: "citysim-export".into(),
             message: String::new(),
             place: PlaceMode::None,
@@ -92,6 +95,9 @@ impl ScenarioState {
     }
 
     pub fn load(path: &std::path::Path, grid: &WalkGrid) -> Result<Scenario, String> {
+        #[cfg(target_arch = "wasm32")]
+        let f = ScenarioFile::parse(crate::web::scenario_text(path)?)?;
+        #[cfg(not(target_arch = "wasm32"))]
         let f = ScenarioFile::load(path)?;
         Scenario::from_file(&f, &grid.projection)
     }

@@ -254,6 +254,7 @@ impl Simulation {
 /// 各要素の計算が独立なので、どちらでも結果は同じ。
 pub mod par {
     /// 十分な量があるときだけスレッドに分ける（少人数ではかえって遅い）
+    #[cfg(not(target_arch = "wasm32"))]
     const MIN_PAR: usize = 512;
 
     #[cfg(not(target_arch = "wasm32"))]

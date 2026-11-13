@@ -6,11 +6,13 @@
 use bevy::prelude::*;
 use bevy_egui::egui;
 use std::path::PathBuf;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::{Arc, Mutex};
 use walkmap::WalkGrid;
 
 pub const DEFAULT_DATA_DIR: &str = "data/plateau";
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Default)]
 struct Job {
     log: Vec<String>,
@@ -24,6 +26,7 @@ pub struct PlaceUi {
     pub data_dir: String,
     /// いま表示している範囲の中心
     center: (f64, f64),
+    #[cfg(not(target_arch = "wasm32"))]
     job: Option<Arc<Mutex<Job>>>,
     error: Option<String>,
 }
@@ -37,13 +40,29 @@ impl PlaceUi {
             radius,
             data_dir: data_dir.display().to_string(),
             center,
+            #[cfg(not(target_arch = "wasm32"))]
             job: None,
             error: None,
         }
     }
 }
 
+/// Web 版: データの取得とプロセスの起動ができないので、同梱の場所だけを案内する。
+#[cfg(target_arch = "wasm32")]
+pub fn panel(ui: &mut egui::Ui, st: &mut PlaceUi) -> bool {
+    ui.small(format!(
+        "いまの中心: {:.5}, {:.5}",
+        st.center.0, st.center.1
+    ));
+    let _ = (&st.query, st.radius, &st.data_dir, &st.error);
+    ui.label("Web 版は同梱の銀座 4 丁目交差点だけを表示します。");
+    ui.small("ほかの場所（住所・緯度経度から PLATEAU を自動取得）はネイティブ版で使えます。");
+    ui.hyperlink_to("ソースコードとネイティブ版の使い方", crate::web::REPO_URL);
+    false
+}
+
 /// パネルを描く。開き直す準備ができたら新しいプロセスを起動して true を返す（呼び出し側で終了する）。
+#[cfg(not(target_arch = "wasm32"))]
 pub fn panel(ui: &mut egui::Ui, st: &mut PlaceUi) -> bool {
     ui.small(format!(
         "いまの中心: {:.5}, {:.5}",
@@ -132,6 +151,7 @@ pub fn panel(ui: &mut egui::Ui, st: &mut PlaceUi) -> bool {
     false
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// 入力データと範囲の指定だけ差し替えて、同じ設定で自分自身を起動し直す。
 fn relaunch_with(p: &plateau_fetch::Prepared) -> anyhow::Result<()> {
     let args = relaunch_args(std::env::args().skip(1), p);
@@ -142,6 +162,7 @@ fn relaunch_with(p: &plateau_fetch::Prepared) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// 場所に依存する引数（入力ファイル・範囲・避難所・録画など）を落とし、新しい GML と範囲を足す。
 fn relaunch_args(old: impl Iterator<Item = String>, p: &plateau_fetch::Prepared) -> Vec<String> {
     // 値を 1 つ取る引数のうち、場所に依存するもの
@@ -182,7 +203,7 @@ fn relaunch_args(old: impl Iterator<Item = String>, p: &plateau_fetch::Prepared)
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 

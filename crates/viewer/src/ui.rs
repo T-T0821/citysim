@@ -68,10 +68,20 @@ pub fn install_fonts(ctx: &egui::Context, explicit: Option<&std::path::Path>) {
             .map(Into::into),
         )
         .collect();
-    let Some((path, bytes)) = candidates
+    // Web 版はファイルを読めないので同梱のフォントを使う
+    #[cfg(target_arch = "wasm32")]
+    let found = {
+        let _ = candidates;
+        Some((
+            std::path::PathBuf::from("Noto Sans JP (同梱)"),
+            crate::web::FONT.to_vec(),
+        ))
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let found = candidates
         .iter()
-        .find_map(|p| std::fs::read(p).ok().map(|b| (p.clone(), b)))
-    else {
+        .find_map(|p| std::fs::read(p).ok().map(|b| (p.clone(), b)));
+    let Some((path, bytes)) = found else {
         warn!("日本語フォントが見つかりません。パネルの日本語は表示されないことがあります (PLATEAU_UI_FONT で指定できます)");
         return;
     };
