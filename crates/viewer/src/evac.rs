@@ -91,31 +91,39 @@ pub fn tools_window(
     mut place: ResMut<PlaceUi>,
     mut settings: ResMut<crate::ui::Settings>,
     mut exit: EventWriter<AppExit>,
+    layout: Res<crate::ui::Layout>,
 ) {
     let Some(ctx) = contexts.try_ctx_mut() else {
         return;
     };
     let ctx = ctx.clone();
+    let body = |ui: &mut egui::Ui| {
+        egui::CollapsingHeader::new("場所を選ぶ")
+            .default_open(false)
+            .show(ui, |ui| {
+                if crate::place::panel(ui, &mut place) {
+                    exit.write(AppExit::Success);
+                }
+            });
+        egui::CollapsingHeader::new("災害避難モード")
+            .default_open(true)
+            .show(ui, |ui| {
+                evac_panel(ui, &mut state, &mut ui_state, &mut settings)
+            });
+    };
+    if layout.compact {
+        if layout.shows(crate::ui::Tab::Tools) {
+            crate::ui::sheet(&ctx, "tools_sheet", body);
+        }
+        return;
+    }
     egui::Window::new("場所・避難")
         // 左上はシナリオのウィンドウ、右は設定パネルなので、3D 表示の右下に置く
         .anchor(egui::Align2::RIGHT_BOTTOM, [-350.0, -10.0])
         .default_width(300.0)
         .resizable(false)
         .collapsible(true)
-        .show(&ctx, |ui| {
-            egui::CollapsingHeader::new("場所を選ぶ")
-                .default_open(false)
-                .show(ui, |ui| {
-                    if crate::place::panel(ui, &mut place) {
-                        exit.write(AppExit::Success);
-                    }
-                });
-            egui::CollapsingHeader::new("災害避難モード")
-                .default_open(true)
-                .show(ui, |ui| {
-                    evac_panel(ui, &mut state, &mut ui_state, &mut settings)
-                });
-        });
+        .show(&ctx, body);
 }
 
 fn evac_panel(

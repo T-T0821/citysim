@@ -361,6 +361,7 @@ pub fn scenario_panel(
     mut capture: ResMut<UiCapture>,
     buttons: Res<ButtonInput<MouseButton>>,
     mut overlay: Query<&mut Visibility, With<crate::HeatOverlay>>,
+    layout: Res<crate::ui::Layout>,
 ) {
     let Some(ctx) = contexts.try_ctx_mut() else {
         return;
@@ -368,384 +369,386 @@ pub fn scenario_panel(
     let ctx = ctx.clone();
     let scen = &mut *scen;
     let mut apply = false;
-    egui::Window::new("シナリオ・通行止め・結果")
-        .default_pos([12.0, 70.0])
-        .default_width(320.0)
-        .default_open(true)
-        .default_height((ctx.screen_rect().height() - 90.0).max(200.0))
-        .max_height((ctx.screen_rect().height() - 90.0).max(200.0))
-        .vscroll(true)
-        .show(&ctx, |ui| {
-            // ---- ファイル
-            ui.horizontal(|ui| {
-                ui.label("ファイル");
-                ui.add(egui::TextEdit::singleline(&mut scen.path).desired_width(150.0));
-                if ui.button("読込").clicked() {
-                    match ScenarioState::load(std::path::Path::new(&scen.path), &scen.base_grid) {
-                        Ok(sc) => {
-                            if let Some(n) = sc.background_agents {
-                                settings.agents = n;
-                            }
-                            if let Some(n) = sc.vehicles {
-                                settings.vehicles = n;
-                            }
-                            if let Some(z) = sc.zone_size {
-                                scen.zone_size = z;
-                            }
-                            scen.message = format!(
-                                "読み込みました: 発生源 {} / 行き先 {} / 通行止め {}",
-                                sc.sources.len(),
-                                sc.destinations.len(),
-                                sc.closures.len()
-                            );
-                            scen.scenario = sc;
-                            scen.markers_dirty = true;
-                            apply = true;
+    let body = |ui: &mut egui::Ui| {
+        // ---- ファイル
+        ui.horizontal(|ui| {
+            ui.label("ファイル");
+            ui.add(egui::TextEdit::singleline(&mut scen.path).desired_width(150.0));
+            if ui.button("読込").clicked() {
+                match ScenarioState::load(std::path::Path::new(&scen.path), &scen.base_grid) {
+                    Ok(sc) => {
+                        if let Some(n) = sc.background_agents {
+                            settings.agents = n;
                         }
-                        Err(e) => scen.message = format!("読込エラー: {e}"),
+                        if let Some(n) = sc.vehicles {
+                            settings.vehicles = n;
+                        }
+                        if let Some(z) = sc.zone_size {
+                            scen.zone_size = z;
+                        }
+                        scen.message = format!(
+                            "読み込みました: 発生源 {} / 行き先 {} / 通行止め {}",
+                            sc.sources.len(),
+                            sc.destinations.len(),
+                            sc.closures.len()
+                        );
+                        scen.scenario = sc;
+                        scen.markers_dirty = true;
+                        apply = true;
                     }
+                    Err(e) => scen.message = format!("読込エラー: {e}"),
                 }
-                if ui.button("保存").clicked() {
-                    let mut sc = scen.scenario.clone();
-                    sc.background_agents = Some(settings.agents);
-                    sc.vehicles = Some(settings.vehicles);
-                    sc.zone_size = Some(scen.zone_size);
-                    let text = sc.to_file(&scen.base_grid.projection).to_toml();
-                    scen.message = match std::fs::write(&scen.path, text) {
-                        Ok(()) => format!("保存しました: {}", scen.path),
-                        Err(e) => format!("保存エラー: {e}"),
-                    };
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("名前");
-                ui.text_edit_singleline(&mut scen.scenario.name);
-            });
-            ui.horizontal(|ui| {
-                ui.label("開始時刻");
-                let mut s = scen
-                    .scenario
-                    .start_clock
-                    .map(|c| format_clock(c)[..5].to_string())
-                    .unwrap_or_default();
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut s)
-                            .desired_width(60.0)
-                            .hint_text("HH:MM"),
-                    )
-                    .changed()
-                {
-                    scen.scenario.start_clock = parse_clock(&s).ok();
-                }
-                ui.label(format!(
-                    "現在 {}",
-                    scen.scenario.clock_label(state.sim.time)
-                ));
-            });
-
-            // ---- 発生源
-            let t = state.sim.time;
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.strong("発生源");
-                ui.label(format!(
-                    "いま {:.0} 人/分・累計 {} 人{}",
-                    scen.scenario.total_rate(t),
-                    scen.spawner.as_ref().map_or(0, |s| s.total_spawned()),
-                    scen.spawner
-                        .as_ref()
-                        .map(|s| s.backlog())
-                        .filter(|&b| b > 0)
-                        .map_or(String::new(), |b| format!("（出口待ち {b}）"))
-                ));
-            });
-            ui.horizontal(|ui| {
-                ui.label("人数の倍率");
-                ui.add(egui::Slider::new(&mut scen.scenario.rate_scale, 0.0..=5.0).suffix("x"));
-            });
-            let goal_names = scen.goal_names.clone();
-            let start = scen.scenario.start_clock;
-            let spawned = scen
-                .spawner
-                .as_ref()
-                .map(|s| s.spawned())
-                .unwrap_or_default();
-            let mut remove = None;
-            let mut changed = false;
-            for (i, s) in scen.scenario.sources.iter_mut().enumerate() {
-                let title = format!(
-                    "{} {} ({:.0} 人/分, 累計 {})",
-                    if s.enabled { "●" } else { "○" },
-                    s.name,
-                    s.rate_at(t),
-                    spawned.get(i).copied().unwrap_or(0)
-                );
-                egui::CollapsingHeader::new(title)
-                    .id_salt(("src", i))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            changed |= ui.checkbox(&mut s.enabled, "有効").changed();
-                            ui.text_edit_singleline(&mut s.name);
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("半径");
-                            changed |= ui
-                                .add(
-                                    egui::DragValue::new(&mut s.radius)
-                                        .range(0.5..=50.0)
-                                        .suffix(" m"),
-                                )
-                                .changed();
-                            ui.label("歩行速度");
-                            let mut v = s.speed.unwrap_or(1.34);
-                            if ui
-                                .add(
-                                    egui::DragValue::new(&mut v)
-                                        .range(0.3..=2.5)
-                                        .speed(0.01)
-                                        .suffix(" m/s"),
-                                )
-                                .changed()
-                            {
-                                s.speed = Some(v);
-                                changed = true;
-                            }
-                        });
-                        ui.label("時刻ごとの発生人数（間は直線でつなぐ）");
-                        let mut del = None;
-                        egui::Grid::new(("rate", i)).num_columns(4).show(ui, |ui| {
-                            for (k, (tt, r)) in s.rate.iter_mut().enumerate() {
-                                changed |= ui
-                                    .add(
-                                        egui::DragValue::new(tt)
-                                            .range(0.0..=86400.0)
-                                            .speed(5.0)
-                                            .suffix(" s"),
-                                    )
-                                    .changed();
-                                ui.label(match start {
-                                    Some(c) => format_clock(c + *tt),
-                                    None => String::new(),
-                                });
-                                changed |= ui
-                                    .add(
-                                        egui::DragValue::new(r)
-                                            .range(0.0..=2000.0)
-                                            .suffix(" 人/分"),
-                                    )
-                                    .changed();
-                                if ui.small_button("×").clicked() {
-                                    del = Some(k);
-                                }
-                                ui.end_row();
-                            }
-                        });
-                        if let Some(k) = del {
-                            s.rate.remove(k);
-                            changed = true;
-                        }
-                        if ui.small_button("＋ 点を追加").clicked() {
-                            let last = s.rate.last().copied().unwrap_or((t, 30.0));
-                            s.rate.push((last.0 + 300.0, last.1));
-                            changed = true;
-                        }
-                        s.rate.sort_by(|a, b| a.0.total_cmp(&b.0));
-                        ui.label("行き先（未選択なら全部から等確率）");
-                        ui.horizontal_wrapped(|ui| {
-                            for g in &goal_names {
-                                let pos = s.to.iter().position(|(n, _)| n == g);
-                                let mut on = pos.is_some();
-                                if ui.checkbox(&mut on, g).changed() {
-                                    match pos {
-                                        Some(p) => {
-                                            s.to.remove(p);
-                                        }
-                                        None => s.to.push((g.clone(), 1.0)),
-                                    }
-                                    changed = true;
-                                }
-                            }
-                        });
-                        for (n, w) in s.to.iter_mut() {
-                            ui.horizontal(|ui| {
-                                ui.label(format!("  {n} の重み"));
-                                changed |= ui
-                                    .add(egui::DragValue::new(w).range(0.0..=100.0).speed(0.1))
-                                    .changed();
-                            });
-                        }
-                        if ui.button("この発生源を削除").clicked() {
-                            remove = Some(i);
-                        }
-                    });
             }
-            if let Some(i) = remove {
-                scen.scenario.sources.remove(i);
-                changed = true;
-            }
-
-            // ---- 行き先
-            ui.separator();
-            ui.strong("行き先");
-            ui.small("範囲の縁の 東・西・南・北 は常に使えます");
-            let mut remove = None;
-            for (i, d) in scen.scenario.destinations.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
-                    changed |= ui
-                        .add(egui::TextEdit::singleline(&mut d.name).desired_width(120.0))
-                        .changed();
-                    ui.label("半径");
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut d.radius)
-                                .range(1.0..=50.0)
-                                .suffix(" m"),
-                        )
-                        .changed();
-                    if ui.small_button("×").clicked() {
-                        remove = Some(i);
-                    }
-                });
-            }
-            if let Some(i) = remove {
-                scen.scenario.destinations.remove(i);
-                changed = true;
-            }
-
-            // ---- 通行止め
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.strong("通行止め・工事");
-                changed |= ui
-                    .checkbox(&mut scen.scenario.closures_on, "有効にする")
-                    .changed();
-            });
-            let mut remove = None;
-            for (i, c) in scen.scenario.closures.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
-                    changed |= ui.checkbox(&mut c.enabled, "").changed();
-                    ui.add(egui::TextEdit::singleline(&mut c.name).desired_width(110.0));
-                    egui::ComboBox::from_id_salt(("kind", i))
-                        .selected_text(c.kind.label())
-                        .show_ui(ui, |ui| {
-                            for k in ClosureKind::ALL {
-                                changed |= ui.selectable_value(&mut c.kind, k, k.label()).changed();
-                            }
-                        });
-                    if ui.small_button("×").clicked() {
-                        remove = Some(i);
-                    }
-                });
-            }
-            if let Some(i) = remove {
-                scen.scenario.closures.remove(i);
-                changed = true;
-            }
-
-            // ---- 地図に置く
-            ui.separator();
-            ui.strong("地図に置く");
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut scen.place, PlaceMode::None, "なし");
-                ui.selectable_value(&mut scen.place, PlaceMode::Closure, "通行止め");
-                ui.selectable_value(&mut scen.place, PlaceMode::Source, "発生源");
-                ui.selectable_value(&mut scen.place, PlaceMode::Destination, "行き先");
-            });
-            if scen.place == PlaceMode::Closure {
-                ui.horizontal(|ui| {
-                    egui::ComboBox::from_id_salt("place_kind")
-                        .selected_text(scen.place_kind.label())
-                        .show_ui(ui, |ui| {
-                            for k in ClosureKind::ALL {
-                                ui.selectable_value(&mut scen.place_kind, k, k.label());
-                            }
-                        });
-                    ui.selectable_value(&mut scen.place_shape, ClosureShape::Line, "線");
-                    ui.selectable_value(&mut scen.place_shape, ClosureShape::Rect, "長方形");
-                    ui.add(
-                        egui::DragValue::new(&mut scen.place_width)
-                            .range(1.0..=60.0)
-                            .suffix(" m"),
-                    );
-                });
-                ui.small("道路を横切るように左ドラッグ（クリックだけなら正方形）");
-            } else if scen.place != PlaceMode::None {
-                ui.small("地図を左クリックして置く");
-            }
-            if changed {
-                scen.markers_dirty = true;
-                scen.pending = true;
-            }
-            ui.add_space(4.0);
-            let label = if scen.pending {
-                "適用して最初から（未反映の変更あり）"
-            } else {
-                "適用して最初から"
-            };
-            if ui
-                .add_sized([ui.available_width(), 26.0], egui::Button::new(label))
-                .clicked()
-            {
-                apply = true;
-            }
-
-            // ---- 比較
-            ui.separator();
-            ui.strong("Before / After 比較");
-            ui.horizontal(|ui| {
-                if ui.button("いまの結果を Before に").clicked() {
-                    scen.before = Some(scen.stats.clone());
-                    scen.message =
-                        format!("Before を保存しました（{:.0} 秒分）", scen.stats.elapsed);
-                }
-                if scen.before.is_some() && ui.button("Before を消す").clicked() {
-                    scen.before = None;
-                    scen.diff_view = false;
-                }
-            });
-            if let Some(b) = &scen.before {
-                ui.small(format!(
-                    "Before: {:.0} 秒分 / After: {:.0} 秒分（どちらも 1 秒あたりに直して比べます）",
-                    b.elapsed, scen.stats.elapsed
-                ));
-                if ui
-                    .checkbox(&mut scen.diff_view, "差分ヒートマップ（赤=増, 青=減）")
-                    .changed()
-                    && scen.diff_view
-                {
-                    for mut v in &mut overlay {
-                        *v = Visibility::Visible;
-                    }
-                }
-            } else {
-                ui.small("通行止めを無効にして走らせ「Before に」→ 有効にして「適用」→ 差分を表示");
-            }
-
-            // ---- エクスポート
-            ui.separator();
-            ui.strong("結果のエクスポート");
-            ui.horizontal(|ui| {
-                ui.label("集計区画");
-                if ui
-                    .add(egui::Slider::new(&mut scen.zone_size, 5.0..=100.0).suffix(" m"))
-                    .changed()
-                {
-                    scen.pending = true;
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("出力先");
-                ui.add(egui::TextEdit::singleline(&mut scen.export_dir).desired_width(170.0));
-            });
-            if ui.button("CSV と画像を書き出す").clicked() {
-                scen.message = export(scen, &state);
-            }
-            if !scen.message.is_empty() {
-                ui.separator();
-                ui.small(&scen.message);
+            if ui.button("保存").clicked() {
+                let mut sc = scen.scenario.clone();
+                sc.background_agents = Some(settings.agents);
+                sc.vehicles = Some(settings.vehicles);
+                sc.zone_size = Some(scen.zone_size);
+                let text = sc.to_file(&scen.base_grid.projection).to_toml();
+                scen.message = match std::fs::write(&scen.path, text) {
+                    Ok(()) => format!("保存しました: {}", scen.path),
+                    Err(e) => format!("保存エラー: {e}"),
+                };
             }
         });
+        ui.horizontal(|ui| {
+            ui.label("名前");
+            ui.text_edit_singleline(&mut scen.scenario.name);
+        });
+        ui.horizontal(|ui| {
+            ui.label("開始時刻");
+            let mut s = scen
+                .scenario
+                .start_clock
+                .map(|c| format_clock(c)[..5].to_string())
+                .unwrap_or_default();
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut s)
+                        .desired_width(60.0)
+                        .hint_text("HH:MM"),
+                )
+                .changed()
+            {
+                scen.scenario.start_clock = parse_clock(&s).ok();
+            }
+            ui.label(format!(
+                "現在 {}",
+                scen.scenario.clock_label(state.sim.time)
+            ));
+        });
+
+        // ---- 発生源
+        let t = state.sim.time;
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.strong("発生源");
+            ui.label(format!(
+                "いま {:.0} 人/分・累計 {} 人{}",
+                scen.scenario.total_rate(t),
+                scen.spawner.as_ref().map_or(0, |s| s.total_spawned()),
+                scen.spawner
+                    .as_ref()
+                    .map(|s| s.backlog())
+                    .filter(|&b| b > 0)
+                    .map_or(String::new(), |b| format!("（出口待ち {b}）"))
+            ));
+        });
+        ui.horizontal(|ui| {
+            ui.label("人数の倍率");
+            ui.add(egui::Slider::new(&mut scen.scenario.rate_scale, 0.0..=5.0).suffix("x"));
+        });
+        let goal_names = scen.goal_names.clone();
+        let start = scen.scenario.start_clock;
+        let spawned = scen
+            .spawner
+            .as_ref()
+            .map(|s| s.spawned())
+            .unwrap_or_default();
+        let mut remove = None;
+        let mut changed = false;
+        for (i, s) in scen.scenario.sources.iter_mut().enumerate() {
+            let title = format!(
+                "{} {} ({:.0} 人/分, 累計 {})",
+                if s.enabled { "●" } else { "○" },
+                s.name,
+                s.rate_at(t),
+                spawned.get(i).copied().unwrap_or(0)
+            );
+            egui::CollapsingHeader::new(title)
+                .id_salt(("src", i))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        changed |= ui.checkbox(&mut s.enabled, "有効").changed();
+                        ui.text_edit_singleline(&mut s.name);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("半径");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut s.radius)
+                                    .range(0.5..=50.0)
+                                    .suffix(" m"),
+                            )
+                            .changed();
+                        ui.label("歩行速度");
+                        let mut v = s.speed.unwrap_or(1.34);
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut v)
+                                    .range(0.3..=2.5)
+                                    .speed(0.01)
+                                    .suffix(" m/s"),
+                            )
+                            .changed()
+                        {
+                            s.speed = Some(v);
+                            changed = true;
+                        }
+                    });
+                    ui.label("時刻ごとの発生人数（間は直線でつなぐ）");
+                    let mut del = None;
+                    egui::Grid::new(("rate", i)).num_columns(4).show(ui, |ui| {
+                        for (k, (tt, r)) in s.rate.iter_mut().enumerate() {
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(tt)
+                                        .range(0.0..=86400.0)
+                                        .speed(5.0)
+                                        .suffix(" s"),
+                                )
+                                .changed();
+                            ui.label(match start {
+                                Some(c) => format_clock(c + *tt),
+                                None => String::new(),
+                            });
+                            changed |= ui
+                                .add(egui::DragValue::new(r).range(0.0..=2000.0).suffix(" 人/分"))
+                                .changed();
+                            if ui.small_button("×").clicked() {
+                                del = Some(k);
+                            }
+                            ui.end_row();
+                        }
+                    });
+                    if let Some(k) = del {
+                        s.rate.remove(k);
+                        changed = true;
+                    }
+                    if ui.small_button("＋ 点を追加").clicked() {
+                        let last = s.rate.last().copied().unwrap_or((t, 30.0));
+                        s.rate.push((last.0 + 300.0, last.1));
+                        changed = true;
+                    }
+                    s.rate.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    ui.label("行き先（未選択なら全部から等確率）");
+                    ui.horizontal_wrapped(|ui| {
+                        for g in &goal_names {
+                            let pos = s.to.iter().position(|(n, _)| n == g);
+                            let mut on = pos.is_some();
+                            if ui.checkbox(&mut on, g).changed() {
+                                match pos {
+                                    Some(p) => {
+                                        s.to.remove(p);
+                                    }
+                                    None => s.to.push((g.clone(), 1.0)),
+                                }
+                                changed = true;
+                            }
+                        }
+                    });
+                    for (n, w) in s.to.iter_mut() {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("  {n} の重み"));
+                            changed |= ui
+                                .add(egui::DragValue::new(w).range(0.0..=100.0).speed(0.1))
+                                .changed();
+                        });
+                    }
+                    if ui.button("この発生源を削除").clicked() {
+                        remove = Some(i);
+                    }
+                });
+        }
+        if let Some(i) = remove {
+            scen.scenario.sources.remove(i);
+            changed = true;
+        }
+
+        // ---- 行き先
+        ui.separator();
+        ui.strong("行き先");
+        ui.small("範囲の縁の 東・西・南・北 は常に使えます");
+        let mut remove = None;
+        for (i, d) in scen.scenario.destinations.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                changed |= ui
+                    .add(egui::TextEdit::singleline(&mut d.name).desired_width(120.0))
+                    .changed();
+                ui.label("半径");
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut d.radius)
+                            .range(1.0..=50.0)
+                            .suffix(" m"),
+                    )
+                    .changed();
+                if ui.small_button("×").clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            scen.scenario.destinations.remove(i);
+            changed = true;
+        }
+
+        // ---- 通行止め
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.strong("通行止め・工事");
+            changed |= ui
+                .checkbox(&mut scen.scenario.closures_on, "有効にする")
+                .changed();
+        });
+        let mut remove = None;
+        for (i, c) in scen.scenario.closures.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                changed |= ui.checkbox(&mut c.enabled, "").changed();
+                ui.add(egui::TextEdit::singleline(&mut c.name).desired_width(110.0));
+                egui::ComboBox::from_id_salt(("kind", i))
+                    .selected_text(c.kind.label())
+                    .show_ui(ui, |ui| {
+                        for k in ClosureKind::ALL {
+                            changed |= ui.selectable_value(&mut c.kind, k, k.label()).changed();
+                        }
+                    });
+                if ui.small_button("×").clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            scen.scenario.closures.remove(i);
+            changed = true;
+        }
+
+        // ---- 地図に置く
+        ui.separator();
+        ui.strong("地図に置く");
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut scen.place, PlaceMode::None, "なし");
+            ui.selectable_value(&mut scen.place, PlaceMode::Closure, "通行止め");
+            ui.selectable_value(&mut scen.place, PlaceMode::Source, "発生源");
+            ui.selectable_value(&mut scen.place, PlaceMode::Destination, "行き先");
+        });
+        if scen.place == PlaceMode::Closure {
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("place_kind")
+                    .selected_text(scen.place_kind.label())
+                    .show_ui(ui, |ui| {
+                        for k in ClosureKind::ALL {
+                            ui.selectable_value(&mut scen.place_kind, k, k.label());
+                        }
+                    });
+                ui.selectable_value(&mut scen.place_shape, ClosureShape::Line, "線");
+                ui.selectable_value(&mut scen.place_shape, ClosureShape::Rect, "長方形");
+                ui.add(
+                    egui::DragValue::new(&mut scen.place_width)
+                        .range(1.0..=60.0)
+                        .suffix(" m"),
+                );
+            });
+            ui.small("道路を横切るように左ドラッグ（クリックだけなら正方形）");
+        } else if scen.place != PlaceMode::None {
+            ui.small("地図を左クリックして置く");
+        }
+        if changed {
+            scen.markers_dirty = true;
+            scen.pending = true;
+        }
+        ui.add_space(4.0);
+        let label = if scen.pending {
+            "適用して最初から（未反映の変更あり）"
+        } else {
+            "適用して最初から"
+        };
+        if ui
+            .add_sized([ui.available_width(), 26.0], egui::Button::new(label))
+            .clicked()
+        {
+            apply = true;
+        }
+
+        // ---- 比較
+        ui.separator();
+        ui.strong("Before / After 比較");
+        ui.horizontal(|ui| {
+            if ui.button("いまの結果を Before に").clicked() {
+                scen.before = Some(scen.stats.clone());
+                scen.message = format!("Before を保存しました（{:.0} 秒分）", scen.stats.elapsed);
+            }
+            if scen.before.is_some() && ui.button("Before を消す").clicked() {
+                scen.before = None;
+                scen.diff_view = false;
+            }
+        });
+        if let Some(b) = &scen.before {
+            ui.small(format!(
+                "Before: {:.0} 秒分 / After: {:.0} 秒分（どちらも 1 秒あたりに直して比べます）",
+                b.elapsed, scen.stats.elapsed
+            ));
+            if ui
+                .checkbox(&mut scen.diff_view, "差分ヒートマップ（赤=増, 青=減）")
+                .changed()
+                && scen.diff_view
+            {
+                for mut v in &mut overlay {
+                    *v = Visibility::Visible;
+                }
+            }
+        } else {
+            ui.small("通行止めを無効にして走らせ「Before に」→ 有効にして「適用」→ 差分を表示");
+        }
+
+        // ---- エクスポート
+        ui.separator();
+        ui.strong("結果のエクスポート");
+        ui.horizontal(|ui| {
+            ui.label("集計区画");
+            if ui
+                .add(egui::Slider::new(&mut scen.zone_size, 5.0..=100.0).suffix(" m"))
+                .changed()
+            {
+                scen.pending = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("出力先");
+            ui.add(egui::TextEdit::singleline(&mut scen.export_dir).desired_width(170.0));
+        });
+        if ui.button("CSV と画像を書き出す").clicked() {
+            scen.message = export(scen, &state);
+        }
+        if !scen.message.is_empty() {
+            ui.separator();
+            ui.small(&scen.message);
+        }
+    };
+    if layout.compact {
+        if layout.shows(crate::ui::Tab::Scenario) {
+            crate::ui::sheet(&ctx, "scenario_sheet", body);
+        }
+    } else {
+        egui::Window::new("シナリオ・通行止め・結果")
+            .default_pos([12.0, 70.0])
+            .default_width(320.0)
+            .default_open(true)
+            .default_height((ctx.screen_rect().height() - 90.0).max(200.0))
+            .max_height((ctx.screen_rect().height() - 90.0).max(200.0))
+            .vscroll(true)
+            .show(&ctx, body);
+    }
     if apply {
         settings.apply_requested = true;
     }

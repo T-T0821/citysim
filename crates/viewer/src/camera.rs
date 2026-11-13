@@ -1,6 +1,8 @@
-//! マウス操作のオービットカメラ。
+//! マウス・タッチ操作のオービットカメラ。
 
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit};
+use bevy::input::touch::Touches;
+use bevy::platform::collections::HashSet;
 use bevy::prelude::*;
 
 #[derive(Component)]
@@ -21,9 +23,44 @@ pub fn orbit_camera(
     keys: Res<ButtonInput<KeyCode>>,
     motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
+    touches: Res<Touches>,
+    // UI の上で始まったタッチ（パネルのスクロールなど）はカメラ操作に使わない
+    mut on_ui: Local<HashSet<u64>>,
     mut q: Query<(&mut OrbitCamera, &mut Transform)>,
 ) {
+    for t in touches.iter_just_pressed() {
+        if ui.0 {
+            on_ui.insert(t.id());
+        }
+    }
+    on_ui.retain(|id| touches.get_pressed(*id).is_some());
+    let fingers: Vec<_> = touches
+        .iter()
+        .filter(|t| !on_ui.contains(&t.id()))
+        .collect();
     for (mut cam, mut tf) in &mut q {
+        match fingers[..] {
+            // 1 本指: 回転
+            [a] => {
+                let d = a.delta();
+                cam.yaw -= d.x * 0.008;
+                cam.pitch = (cam.pitch + d.y * 0.008).clamp(0.05, 1.55);
+            }
+            // 2 本指: 中点の移動で平行移動、指の間隔でズーム
+            [a, b, ..] => {
+                let prev = a.previous_position().distance(b.previous_position());
+                let now = a.position().distance(b.position());
+                if prev > 1.0 && now > 1.0 {
+                    cam.distance = (cam.distance * prev / now).clamp(5.0, 20_000.0);
+                }
+                let d = (a.delta() + b.delta()) * 0.5;
+                let right = Vec3::new(cam.yaw.cos(), 0.0, -cam.yaw.sin());
+                let fwd = Vec3::new(-cam.yaw.sin(), 0.0, -cam.yaw.cos());
+                let k = cam.distance * 0.0025;
+                cam.target += (-right * d.x + fwd * d.y) * k;
+            }
+            _ => {}
+        }
         let d = if ui.0 { Vec2::ZERO } else { motion.delta };
         // Shift + 左クリックは避難所の追加に使うので回転しない
         let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
