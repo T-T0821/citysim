@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+bytemuck = { version = "1", features = ["derive"] }
 plateau-gml.workspace = true
 walkmap.workspace = true
 crowd.workspace = true

@@ -1,13 +1,14 @@
-//! 歩行者の見た目: 頭・胴・腕・脚のある簡単な人型を、服や髪の色違いと歩行の姿勢ごとに用意する。
+//! 歩行者の見た目: 頭・胴・腕・脚のある簡単な人型を、歩行の姿勢ごとに用意する。
 //!
-//! 何千人も並ぶので骨格アニメーションは使わず、歩行周期を `PHASES` 段階に分けた姿勢の
-//! メッシュを作っておき、歩いた距離に応じて差し替える。色は頂点カラーで持ち、
-//! マテリアルは全員で 1 つを共有する（同じメッシュの人はまとめて描画される）。
-//! 体格差は Transform の拡大率で付ける。
+//! 何千〜何万人も並ぶので骨格アニメーションは使わず、歩行周期を `PHASES` 段階に分けた姿勢の
+//! メッシュを作っておき、歩いた距離に応じて使う姿勢を選ぶ。描画は `crowd_render` が
+//! 姿勢ごとに 1 回のインスタンス描画で全員ぶんをまとめて行う。
+//! メッシュの頂点には色ではなく部位（上着・ズボン・靴・肌・髪）の番号を持たせ、
+//! 色は 1 人ずつのインスタンスデータ（上着の色と下の組み合わせの番号）からシェーダーで決める。
+//! 体格差もインスタンスデータの拡大率で付ける。遠くの人は数個の箱だけの簡易な人型で描く。
 
 use bevy::asset::RenderAssetUsages;
 use bevy::math::Affine3A;
-use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 use bevy::render::mesh::{Indices, PrimitiveTopology};
 
@@ -97,14 +98,6 @@ pub enum Top {
     Evac,
 }
 
-/// 1 人ぶんの見た目のメッシュを決める鍵
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct Key {
-    pub top: Top,
-    pub lower: u8,
-    pub phase: u8,
-}
-
 /// 歩行者ごとの固定の見た目（服装と体格）。番号から決まるので乱数状態を持たない。
 pub struct Look {
     pub top: u8,
@@ -129,8 +122,7 @@ pub fn look_of(i: usize) -> Look {
     }
 }
 
-/// 歩き方の状態（歩行者の表示エンティティごと）
-#[derive(Component)]
+/// 歩き方の状態（歩行者ごと）
 pub struct Gait {
     /// 前回のフレームの位置
     pub prev: Vec2,
@@ -138,7 +130,6 @@ pub struct Gait {
     pub phase: f32,
     /// 向き（シミュレーション平面での角度, x 軸から反時計回り）
     pub heading: f32,
-    pub key: Option<Key>,
 }
 
 impl Gait {
@@ -152,7 +143,6 @@ impl Gait {
             } else {
                 0.0
             },
-            key: None,
         }
     }
 
@@ -186,35 +176,30 @@ impl Gait {
         }
         ((self.phase * PHASES as f32).round() as u32 % PHASES as u32) as u8
     }
-
-    /// 表示用の回転（人型はローカルの +x を向いて作ってある）
-    pub fn rotation(&self) -> Quat {
-        Quat::from_rotation_y(self.heading)
-    }
 }
 
-/// 人型メッシュの置き場（必要になった組み合わせだけ作る）と共有マテリアル
-#[derive(Resource)]
-pub struct PersonMeshes {
-    map: HashMap<Key, Handle<Mesh>>,
-    pub material: Handle<StandardMaterial>,
+/// 頂点の部位の番号（頂点カラーの r に入れる）。色はシェーダーで人ごとに決める。
+pub mod part {
+    pub const TOP: f32 = 0.0;
+    pub const PANTS: f32 = 1.0;
+    pub const SHOES: f32 = 2.0;
+    pub const SKIN: f32 = 3.0;
+    pub const HAIR: f32 = 4.0;
+    /// 長髪の人だけ髪、ほかは肌（後頭部の下側）
+    pub const LONG_HAIR_OR_SKIN: f32 = 5.0;
+    /// 長髪の人だけにある形（肩にかかる後ろ髪）。短髪の人では潰して見えなくする
+    pub const LONG_HAIR_ONLY: f32 = 6.0;
+}
+
+/// 上着の色（リニア RGB）
+pub struct Palette {
     goal_colors: Vec<Color>,
     evac_color: Color,
 }
 
-impl PersonMeshes {
-    pub fn new(
-        materials: &mut Assets<StandardMaterial>,
-        goal_colors: Vec<Color>,
-        evac_color: Color,
-    ) -> Self {
+impl Palette {
+    pub fn new(goal_colors: Vec<Color>, evac_color: Color) -> Self {
         Self {
-            map: HashMap::default(),
-            material: materials.add(StandardMaterial {
-                base_color: Color::WHITE,
-                perceptual_roughness: 0.85,
-                ..default()
-            }),
             goal_colors,
             evac_color,
         }
@@ -224,11 +209,8 @@ impl PersonMeshes {
         self.goal_colors.len()
     }
 
-    pub fn get(&mut self, meshes: &mut Assets<Mesh>, key: Key) -> Handle<Mesh> {
-        if let Some(h) = self.map.get(&key) {
-            return h.clone();
-        }
-        let top = match key.top {
+    pub fn top(&self, top: Top) -> [f32; 3] {
+        let c = match top {
             Top::Cloth(i) => {
                 let (r, g, b) = TOPS[i as usize % TOPS.len()];
                 Color::srgb(r, g, b)
@@ -236,11 +218,42 @@ impl PersonMeshes {
             Top::Goal(i) => self.goal_colors[i as usize % self.goal_colors.len()],
             Top::Evac => self.evac_color,
         };
-        let lower = &LOWERS[key.lower as usize % LOWERS.len()];
-        let h = meshes.add(build(top, lower, key.phase));
-        self.map.insert(key, h.clone());
-        h
+        let l = LinearRgba::from(c);
+        [l.red, l.green, l.blue]
     }
+}
+
+/// シェーダーに埋め込む、上着以外の組み合わせ（`LOWERS`）の色の表（WGSL）
+pub fn lowers_wgsl() -> String {
+    let arr = |name: &str, f: &dyn Fn(&Lower) -> (f32, f32, f32)| {
+        let items: Vec<String> = LOWERS
+            .iter()
+            .map(|l| {
+                let c = lin(f(l));
+                format!("vec3<f32>({:.5}, {:.5}, {:.5})", c[0], c[1], c[2])
+            })
+            .collect();
+        format!(
+            "const {name}: array<vec3<f32>, {}> = array<vec3<f32>, {}>({});\n",
+            LOWERS.len(),
+            LOWERS.len(),
+            items.join(", ")
+        )
+    };
+    let long: Vec<&str> = LOWERS
+        .iter()
+        .map(|l| if l.long_hair { "1.0" } else { "0.0" })
+        .collect();
+    format!(
+        "{}{}{}{}const LOWER_LONG_HAIR: array<f32, {}> = array<f32, {}>({});\n",
+        arr("LOWER_PANTS", &|l| l.pants),
+        arr("LOWER_SHOES", &|l| l.shoes),
+        arr("LOWER_SKIN", &|l| l.skin),
+        arr("LOWER_HAIR", &|l| l.hair),
+        LOWERS.len(),
+        LOWERS.len(),
+        long.join(", ")
+    )
 }
 
 #[derive(Default)]
@@ -257,19 +270,49 @@ fn lin(c: (f32, f32, f32)) -> [f32; 4] {
 
 impl Builder {
     /// 直方体。`half` は半分の大きさ、上面・底面の水平方向の縮尺で先細りにできる。
-    fn cuboid(&mut self, tf: Affine3A, half: Vec3, bottom: f32, top: f32, color: [f32; 4]) {
+    fn cuboid(&mut self, tf: Affine3A, half: Vec3, bottom: f32, top: f32, pt: f32) {
         let c = |sx: f32, sy: f32, sz: f32| {
             let k = if sy > 0.0 { top } else { bottom };
             tf.transform_point3(Vec3::new(sx * half.x * k, sy * half.y, sz * half.z * k))
         };
         let center = tf.transform_point3(Vec3::ZERO);
         let faces = [
-            [c(1., -1., -1.), c(1., 1., -1.), c(1., 1., 1.), c(1., -1., 1.)],
-            [c(-1., -1., 1.), c(-1., 1., 1.), c(-1., 1., -1.), c(-1., -1., -1.)],
-            [c(-1., 1., -1.), c(-1., 1., 1.), c(1., 1., 1.), c(1., 1., -1.)],
-            [c(-1., -1., 1.), c(-1., -1., -1.), c(1., -1., -1.), c(1., -1., 1.)],
-            [c(-1., -1., 1.), c(1., -1., 1.), c(1., 1., 1.), c(-1., 1., 1.)],
-            [c(1., -1., -1.), c(-1., -1., -1.), c(-1., 1., -1.), c(1., 1., -1.)],
+            [
+                c(1., -1., -1.),
+                c(1., 1., -1.),
+                c(1., 1., 1.),
+                c(1., -1., 1.),
+            ],
+            [
+                c(-1., -1., 1.),
+                c(-1., 1., 1.),
+                c(-1., 1., -1.),
+                c(-1., -1., -1.),
+            ],
+            [
+                c(-1., 1., -1.),
+                c(-1., 1., 1.),
+                c(1., 1., 1.),
+                c(1., 1., -1.),
+            ],
+            [
+                c(-1., -1., 1.),
+                c(-1., -1., -1.),
+                c(1., -1., -1.),
+                c(1., -1., 1.),
+            ],
+            [
+                c(-1., -1., 1.),
+                c(1., -1., 1.),
+                c(1., 1., 1.),
+                c(-1., 1., 1.),
+            ],
+            [
+                c(1., -1., -1.),
+                c(-1., -1., -1.),
+                c(-1., 1., -1.),
+                c(1., 1., -1.),
+            ],
         ];
         for mut f in faces {
             let mut n = (f[1] - f[0]).cross(f[2] - f[0]).normalize_or_zero();
@@ -282,15 +325,15 @@ impl Builder {
             for p in f {
                 self.pos.push(p.to_array());
                 self.nrm.push(n.to_array());
-                self.col.push(color);
+                self.col.push([pt, 0.0, 0.0, 1.0]);
             }
             self.idx
                 .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
         }
     }
 
-    /// 頭: 少し縦長の低ポリゴン球。法線の向きで髪と肌を塗り分ける。
-    fn head(&mut self, center: Vec3, r: f32, skin: [f32; 4], hair: [f32; 4], long_hair: bool) {
+    /// 頭: 少し縦長の低ポリゴン球。法線の向きで髪と肌（の部位）を塗り分ける。
+    fn head(&mut self, center: Vec3, r: f32) {
         const LAT: u32 = 6;
         const LON: u32 = 8;
         let base = self.pos.len() as u32;
@@ -301,11 +344,17 @@ impl Builder {
                 let n = Vec3::new(th.sin() * ph.cos(), th.cos(), th.sin() * ph.sin());
                 let p = center + Vec3::new(n.x * r, n.y * r * 1.15, n.z * r * 0.95);
                 // 頭頂と後頭部は髪（顔は +x 側）。長髪は後ろを首まで覆う。
-                let back_limit = if long_hair { -0.9 } else { -0.55 };
-                let is_hair = n.y > 0.3 || (n.x < -0.2 && n.y > back_limit);
+                let back = n.x < -0.2;
+                let pt = if n.y > 0.3 || (back && n.y > -0.55) {
+                    part::HAIR
+                } else if back && n.y > -0.9 {
+                    part::LONG_HAIR_OR_SKIN
+                } else {
+                    part::SKIN
+                };
                 self.pos.push(p.to_array());
                 self.nrm.push(n.to_array());
-                self.col.push(if is_hair { hair } else { skin });
+                self.col.push([pt, 0.0, 0.0, 1.0]);
             }
         }
         for i in 0..LAT {
@@ -330,13 +379,7 @@ impl Builder {
 }
 
 /// 足裏を原点、+x を前、+y を上にした身長 1.7 m ほどの人型。`phase` 番目の歩行姿勢。
-fn build(top: Color, lower: &Lower, phase: u8) -> Mesh {
-    let top = LinearRgba::from(top).to_f32_array();
-    let pants = lin(lower.pants);
-    let shoes = lin(lower.shoes);
-    let skin = lin(lower.skin);
-    let hair = lin(lower.hair);
-
+pub fn build(phase: u8) -> Mesh {
     let s = (std::f32::consts::TAU * phase as f32 / PHASES as f32).sin();
     let leg = s * LEG_SWING;
     // 脚を開くと腰が下がる（上下の揺れ）
@@ -354,20 +397,32 @@ fn build(top: Color, lower: &Lower, phase: u8) -> Mesh {
             Vec3::new(0.07, thigh * 0.5, 0.065),
             0.8,
             1.0,
-            pants,
+            part::PANTS,
         );
         b.cuboid(
             hip * Affine3A::from_translation(Vec3::new(0.035, -HIP + 0.04, 0.0)),
             Vec3::new(0.12, 0.04, 0.055),
             1.0,
             1.0,
-            shoes,
+            part::SHOES,
         );
     }
     // 腰
-    b.cuboid(at(0.0, HIP + 0.02, 0.0), Vec3::new(0.10, 0.08, 0.165), 1.0, 1.0, pants);
+    b.cuboid(
+        at(0.0, HIP + 0.02, 0.0),
+        Vec3::new(0.10, 0.08, 0.165),
+        1.0,
+        1.0,
+        part::PANTS,
+    );
     // 胴（肩に向かって少し広がる）
-    b.cuboid(at(0.0, 1.14, 0.0), Vec3::new(0.11, 0.28, 0.19), 0.85, 1.0, top);
+    b.cuboid(
+        at(0.0, 1.14, 0.0),
+        Vec3::new(0.11, 0.28, 0.19),
+        0.85,
+        1.0,
+        part::TOP,
+    );
     // 腕（脚と逆に振る）と手
     for (side, angle) in [(1.0f32, -leg * 0.7), (-1.0, leg * 0.7)] {
         let sh = at(0.0, 1.37, side * 0.235) * Affine3A::from_rotation_z(angle);
@@ -376,29 +431,84 @@ fn build(top: Color, lower: &Lower, phase: u8) -> Mesh {
             Vec3::new(0.055, 0.25, 0.05),
             0.85,
             1.0,
-            top,
+            part::TOP,
         );
         b.cuboid(
             sh * Affine3A::from_translation(Vec3::new(0.0, -0.55, 0.0)),
             Vec3::new(0.045, 0.05, 0.035),
             1.0,
             1.0,
-            skin,
+            part::SKIN,
         );
     }
     // 首と頭
-    b.cuboid(at(0.0, 1.45, 0.0), Vec3::new(0.045, 0.04, 0.05), 1.0, 1.0, skin);
+    b.cuboid(
+        at(0.0, 1.45, 0.0),
+        Vec3::new(0.045, 0.04, 0.05),
+        1.0,
+        1.0,
+        part::SKIN,
+    );
     let head_c = root.transform_point3(Vec3::new(0.01, 1.585, 0.0));
-    b.head(head_c, 0.105, skin, hair, lower.long_hair);
-    if lower.long_hair {
-        // 肩にかかる後ろ髪
-        b.cuboid(at(-0.07, 1.47, 0.0), Vec3::new(0.03, 0.09, 0.09), 1.0, 1.0, hair);
-    }
+    b.head(head_c, 0.105);
+    // 肩にかかる後ろ髪（長髪の人だけ）
+    b.cuboid(
+        at(-0.07, 1.47, 0.0),
+        Vec3::new(0.03, 0.09, 0.09),
+        1.0,
+        1.0,
+        part::LONG_HAIR_ONLY,
+    );
     // 踏み出した足のかかとが地面に沈まないよう、いちばん低い点を地面にそろえる
     let min_y = b.pos.iter().map(|p| p[1]).fold(f32::MAX, f32::min);
     for p in &mut b.pos {
         p[1] -= min_y;
     }
+    b.build()
+}
+
+/// 遠くから見る用の簡易な人型（箱 5 つ、歩行姿勢なし）。数ピクセルの大きさでは違いが見えない。
+pub fn build_far() -> Mesh {
+    let at = |x: f32, y: f32, z: f32| Affine3A::from_translation(Vec3::new(x, y, z));
+    let mut b = Builder::default();
+    // 脚（2 本をまとめた 1 つの箱）と靴
+    b.cuboid(
+        at(0.0, 0.47, 0.0),
+        Vec3::new(0.08, 0.40, 0.15),
+        0.9,
+        1.0,
+        part::PANTS,
+    );
+    b.cuboid(
+        at(0.03, 0.04, 0.0),
+        Vec3::new(0.12, 0.04, 0.15),
+        1.0,
+        1.0,
+        part::SHOES,
+    );
+    // 胴と腕（腕は胴の幅に含める）
+    b.cuboid(
+        at(0.0, 1.13, 0.0),
+        Vec3::new(0.11, 0.29, 0.25),
+        0.85,
+        1.0,
+        part::TOP,
+    );
+    // 顔と髪
+    b.cuboid(
+        at(0.01, 1.55, 0.0),
+        Vec3::new(0.10, 0.09, 0.09),
+        1.0,
+        1.0,
+        part::SKIN,
+    );
+    b.cuboid(
+        at(-0.01, 1.66, 0.0),
+        Vec3::new(0.11, 0.04, 0.10),
+        1.0,
+        1.0,
+        part::HAIR,
+    );
     b.build()
 }
 
@@ -409,14 +519,38 @@ mod tests {
     #[test]
     fn person_mesh_stands_on_ground() {
         for phase in 0..PHASES {
-            let m = build(Color::WHITE, &LOWERS[1], phase);
-            let pos = m.attribute(Mesh::ATTRIBUTE_POSITION).unwrap().as_float3().unwrap();
+            let m = build(phase);
+            let pos = m
+                .attribute(Mesh::ATTRIBUTE_POSITION)
+                .unwrap()
+                .as_float3()
+                .unwrap();
             let min_y = pos.iter().map(|p| p[1]).fold(f32::MAX, f32::min);
             let max_y = pos.iter().map(|p| p[1]).fold(f32::MIN, f32::max);
             assert!(min_y.abs() < 1e-4, "phase {phase}: 足が地面から {min_y} m");
             assert!((1.6..1.8).contains(&max_y), "phase {phase}: 身長 {max_y} m");
             assert!(pos.len() < 400, "頂点数 {}", pos.len());
         }
+    }
+
+    #[test]
+    fn far_mesh_is_small_and_same_height() {
+        let m = build_far();
+        let pos = m
+            .attribute(Mesh::ATTRIBUTE_POSITION)
+            .unwrap()
+            .as_float3()
+            .unwrap();
+        let max_y = pos.iter().map(|p| p[1]).fold(f32::MIN, f32::max);
+        assert!((1.6..1.8).contains(&max_y), "身長 {max_y} m");
+        assert!(pos.len() <= 5 * 24);
+    }
+
+    #[test]
+    fn lowers_table_is_valid_wgsl_consts() {
+        let w = lowers_wgsl();
+        assert_eq!(w.matches("const ").count(), 5);
+        assert!(w.contains(&format!("array<vec3<f32>, {}>", LOWERS.len())));
     }
 
     #[test]
