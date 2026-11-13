@@ -396,12 +396,20 @@ impl FlowField {
 
     /// 位置 p における進行方向（単位ベクトル）。到達不能なら None。
     pub fn direction(&self, grid: &WalkGrid, p: Vec2) -> Option<Vec2> {
+        match self.next_cell(grid, p)? {
+            Some((x, y)) => (grid.center(x, y) - p).try_normalize(),
+            None => Some(Vec2::ZERO), // 目的地セル
+        }
+    }
+
+    /// 位置 p から次に向かうセル（近傍で最も距離の小さいセル。補間ノイズに強い）。
+    /// 到達不能なら None、目的地セルにいれば Some(None)。
+    pub fn next_cell(&self, grid: &WalkGrid, p: Vec2) -> Option<Option<(usize, usize)>> {
         let (cx, cy) = grid.cell_of(p)?;
         let here = self.dist[grid.idx(cx, cy)];
         if !here.is_finite() {
             return None;
         }
-        // 近傍で最も距離の小さいセル中心へ向かう（補間ノイズに強い）
         let mut best = (here, None);
         for dy in -1i32..=1 {
             for dx in -1i32..=1 {
@@ -415,10 +423,7 @@ impl FlowField {
                 }
             }
         }
-        match best.1 {
-            Some((x, y)) => (grid.center(x, y) - p).try_normalize(),
-            None => Some(Vec2::ZERO), // 目的地セル
-        }
+        Some(best.1)
     }
 
     pub fn distance(&self, grid: &WalkGrid, p: Vec2) -> f32 {
