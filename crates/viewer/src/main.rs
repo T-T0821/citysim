@@ -4,6 +4,7 @@
 //!       Space=一時停止 / ↑↓=再生速度 / H=ヒートマップ表示切替
 
 mod camera;
+mod crowd_render;
 mod evac;
 mod geometry;
 mod person;
@@ -389,8 +390,17 @@ struct ScreenshotPlan {
     taken_frame: Option<u32>,
 }
 
-#[derive(Component)]
-struct AgentVis(usize);
+/// 歩行者の表示: 上着の色、1 人ずつの歩き方の状態、まとめて描くエンティティ
+/// （`groups[k]` は歩行姿勢 k、最後が遠景用の簡易な人型）
+#[derive(Resource)]
+struct People {
+    palette: person::Palette,
+    gaits: Vec<person::Gait>,
+    groups: Vec<Entity>,
+}
+
+/// 画面上の身長がこれ [px] より小さい人は簡易な人型で描く
+const FAR_PERSON_PX: f32 = 24.0;
 
 #[derive(Component)]
 pub struct HeatOverlay;
@@ -437,8 +447,10 @@ fn is_mobile() -> bool {
     false
 }
 
-/// スマホで人数・台数を指定しなかったときの上限（描画と計算を軽くする）
-const MOBILE_AGENTS: usize = 400;
+/// スマホで人数・台数を指定しなかったときの上限（計算を軽くする）。
+/// 歩行者はインスタンス描画なので描画の重さは人数にあまりよらず、上限は主に歩行者の計算で決まる
+/// （CPU を 4 倍遅くした計測からの見積もりで、1000 人なら 30fps 前後）
+const MOBILE_AGENTS: usize = 1000;
 const MOBILE_VEHICLES: usize = 40;
 
 fn run() -> Result<()> {
@@ -536,6 +548,7 @@ fn run() -> Result<()> {
         }),
         ..default()
     }))
+    .add_plugins(crowd_render::CrowdRenderPlugin)
     .insert_resource(ClearColor(Color::srgb(0.62, 0.72, 0.82)))
     .insert_resource(AmbientLight {
         brightness: 400.0,
@@ -567,7 +580,6 @@ fn run() -> Result<()> {
             camera::orbit_camera,
             controls,
             step_sim,
-            spawn_new_agents,
             scenario::sync_markers,
             sync_agents,
             sync_cars,
@@ -763,11 +775,28 @@ fn setup(
         Color::srgb(0.95, 0.45, 0.70),
         Color::srgb(0.55, 0.35, 0.15),
     ];
-    let mut people = person::PersonMeshes::new(
-        &mut materials,
-        palette.to_vec(),
-        Color::srgb(0.10, 0.95, 0.55),
-    );
+    // 歩行者: 歩行姿勢ごとと遠景用に 1 つずつ、まとめて描くエンティティを置く
+    let groups = (0..person::PHASES)
+        .map(person::build)
+        .chain([person::build_far()])
+        .map(|m| {
+            commands
+                .spawn((
+                    Mesh3d(meshes.add(m)),
+                    crowd_render::PersonInstances::default(),
+                    // 位置はインスタンスごとに持つので、エンティティ単位の視錐台判定はしない
+                    bevy::render::view::NoFrustumCulling,
+                    Transform::default(),
+                    Visibility::default(),
+                ))
+                .id()
+        })
+        .collect();
+    commands.insert_resource(People {
+        palette: person::Palette::new(palette.to_vec(), Color::srgb(0.10, 0.95, 0.55)),
+        gaits: vec![],
+        groups,
+    });
     let visuals = Visuals {
         heat_image,
         car_mats,
@@ -782,8 +811,7 @@ fn setup(
             ..default()
         }),
     };
-    spawn_entities(&mut commands, &mut meshes, &visuals, &mut people, &state);
-    commands.insert_resource(people);
+    spawn_entities(&mut commands, &mut meshes, &visuals, &state);
     let signal_mats = signals::SignalMats::new(&mut meshes, &mut materials);
     signals::spawn(&mut commands, &mut meshes, &signal_mats, &state);
     commands.insert_resource(signal_mats);
@@ -815,6 +843,8 @@ fn setup(
     }
     commands.spawn((
         Camera3d::default(),
+        // 歩行者のインスタンス描画（crowd_render）は間接描画を使わない
+        bevy::render::view::NoIndirectDrawing,
         // スマホではアンチエイリアスを切って描画を軽くする
         if is_mobile() {
             Msaa::Off
@@ -849,17 +879,13 @@ fn setup(
     commands.insert_resource(visuals);
 }
 
-/// 歩行者と車のエンティティを現在の `SimState` に合わせて生成する。
+/// 車のエンティティを現在の `SimState` に合わせて生成する。
 fn spawn_entities(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     visuals: &Visuals,
-    people: &mut person::PersonMeshes,
     state: &SimState,
 ) {
-    for (i, a) in state.sim.agents.iter().enumerate() {
-        commands.spawn(agent_bundle(meshes, people, i, a));
-    }
     let Some(t) = &state.traffic else { return };
     for (i, v) in t.vehicles.iter().enumerate() {
         match v.kind {
@@ -912,36 +938,6 @@ fn spawn_entities(
                 ));
             });
     }
-}
-
-/// 歩行者 1 人の表示。メッシュ（服装と姿勢）は `sync_agents` が毎フレーム選び直す。
-fn agent_bundle(
-    meshes: &mut Assets<Mesh>,
-    people: &mut person::PersonMeshes,
-    i: usize,
-    a: &crowd::Agent,
-) -> impl Bundle {
-    let look = person::look_of(i);
-    let gait = person::Gait::new(a.pos, a.vel, i);
-    let key = person::Key {
-        top: person::Top::Cloth(look.top),
-        lower: look.lower,
-        phase: 0,
-    };
-    (
-        AgentVis(i),
-        Mesh3d(people.get(meshes, key)),
-        MeshMaterial3d(people.material.clone()),
-        Transform::from_translation(to_world(a.pos, 0.0))
-            .with_rotation(gait.rotation())
-            .with_scale(look.scale),
-        gait,
-        if a.arrived {
-            Visibility::Hidden
-        } else {
-            Visibility::Inherited
-        },
-    )
 }
 
 /// バス: 低床の長い車体に窓の帯。
@@ -1032,9 +1028,8 @@ fn apply_settings(
     mut state: ResMut<SimState>,
     mut scen: ResMut<scenario::ScenarioState>,
     visuals: Res<Visuals>,
-    mut people: ResMut<person::PersonMeshes>,
+    mut people: ResMut<People>,
     signal_mats: Res<signals::SignalMats>,
-    agents: Query<Entity, With<AgentVis>>,
     cars: Query<Entity, With<CarVis>>,
     signal_ents: Query<Entity, With<signals::SignalEntity>>,
 ) {
@@ -1062,10 +1057,11 @@ fn apply_settings(
     st.acc = 0.0;
     st.heat.iter_mut().for_each(|h| *h = 0);
     st.heat_dirty = true;
-    for e in agents.iter().chain(cars.iter()).chain(signal_ents.iter()) {
+    for e in cars.iter().chain(signal_ents.iter()) {
         commands.entity(e).despawn();
     }
-    spawn_entities(&mut commands, &mut meshes, &visuals, &mut people, st);
+    people.gaits.clear();
+    spawn_entities(&mut commands, &mut meshes, &visuals, st);
     signals::spawn(&mut commands, &mut meshes, &signal_mats, st);
     info!(
         "作り直し: 歩行者 {} 人, 車 {} 台",
@@ -1245,53 +1241,58 @@ fn respawn_arrived(st: &mut SimState, limit: usize) {
     }
 }
 
-/// シナリオの発生源で増えた歩行者の表示を足す。
-fn spawn_new_agents(
-    mut commands: Commands,
-    state: Res<SimState>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut people: ResMut<person::PersonMeshes>,
-    q: Query<&AgentVis>,
-) {
-    let have = q.iter().count();
-    for (i, a) in state.sim.agents.iter().enumerate().skip(have) {
-        commands.spawn(agent_bundle(&mut meshes, &mut people, i, a));
-    }
-}
-
+/// 歩行者の表示を更新する: 歩き方を進め、姿勢ごと（遠くの人は簡易表示）のインスタンスの配列に振り分ける。
+/// シナリオの発生源で増えた人もここで加わる。
 fn sync_agents(
     state: Res<SimState>,
     settings: Res<Settings>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut people: ResMut<person::PersonMeshes>,
-    mut q: Query<(
-        &AgentVis,
-        &mut person::Gait,
-        &mut Transform,
-        &mut Visibility,
-        &mut Mesh3d,
-    )>,
+    mut people: ResMut<People>,
+    camera: Query<(&Transform, &Projection), With<Camera3d>>,
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    mut groups: Query<&mut crowd_render::PersonInstances>,
 ) {
-    let evac = state.evac_goals();
-    let n_goals = people.goal_count();
-    for (AgentVis(i), mut gait, mut tf, mut vis, mut mesh) in &mut q {
-        let Some(a) = state.sim.agents.get(*i) else {
-            continue;
-        };
-        let want = if a.arrived {
-            Visibility::Hidden
-        } else {
-            Visibility::Inherited
-        };
-        if *vis != want {
-            *vis = want;
+    let people = &mut *people;
+    let agents = &state.sim.agents;
+    if people.gaits.len() > agents.len() {
+        people.gaits.clear();
+    }
+    for (i, a) in agents.iter().enumerate().skip(people.gaits.len()) {
+        people.gaits.push(person::Gait::new(a.pos, a.vel, i));
+    }
+    // 画面上で身長 1 m が何 px になるか（距離 1 m あたり）
+    let (cam, px_per_m) = match camera.single() {
+        Ok((tf, Projection::Perspective(p))) => {
+            let h = windows.single().map_or(800.0, |w| w.height());
+            (tf.translation, h / (2.0 * (p.fov * 0.5).tan()))
         }
+        Ok((tf, _)) => (tf.translation, f32::INFINITY),
+        Err(_) => (Vec3::ZERO, f32::INFINITY),
+    };
+    // 身長 1.7 m の人が FAR_PERSON_PX より小さく見える距離の 2 乗
+    let far2 = (1.7 * px_per_m / FAR_PERSON_PX).powi(2);
+
+    let mut lists: Vec<Vec<crowd_render::PersonInstance>> = people
+        .groups
+        .iter()
+        .map(|e| {
+            groups
+                .get_mut(*e)
+                .map(|mut g| std::mem::take(&mut g.0))
+                .unwrap_or_default()
+        })
+        .collect();
+    lists.iter_mut().for_each(|l| l.clear());
+    let far = lists.len() - 1;
+
+    let evac = state.evac_goals();
+    let n_goals = people.palette.goal_count();
+    for (i, (a, gait)) in agents.iter().zip(people.gaits.iter_mut()).enumerate() {
         if a.arrived {
             gait.prev = a.pos;
             continue;
         }
         let phase = gait.advance(a.pos, a.vel);
-        let look = person::look_of(*i);
+        let look = person::look_of(i);
         let top = if evac.as_ref().is_some_and(|r| r.contains(&a.goal)) {
             person::Top::Evac
         } else if settings.color_by_goal {
@@ -1299,21 +1300,22 @@ fn sync_agents(
         } else {
             person::Top::Cloth(look.top)
         };
-        let key = person::Key {
-            top,
-            lower: look.lower,
-            phase,
-        };
-        // 変わらないものに書き込むと変更扱いになり、変換の伝播・GPU 転送が毎フレーム走る
-        if gait.key != Some(key) {
-            gait.key = Some(key);
-            mesh.0 = people.get(&mut meshes, key);
-        }
         let t = to_world(a.pos, 0.0);
-        let r = gait.rotation();
-        if tf.translation != t || tf.rotation != r {
-            tf.translation = t;
-            tf.rotation = r;
+        let k = if t.distance_squared(cam) > far2 {
+            far
+        } else {
+            phase as usize
+        };
+        let c = people.palette.top(top);
+        lists[k].push(crowd_render::PersonInstance {
+            pos_heading: [t.x, t.y, t.z, gait.heading],
+            scale_lower: [look.scale.x, look.scale.y, look.lower as f32, 0.0],
+            top: [c[0], c[1], c[2], 0.0],
+        });
+    }
+    for (e, list) in people.groups.iter().zip(lists) {
+        if let Ok(mut g) = groups.get_mut(*e) {
+            g.0 = list;
         }
     }
 }

@@ -232,7 +232,7 @@ pub fn settings_panel(
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
                 ui.label("歩行者数");
-                ui.add(egui::Slider::new(&mut settings.agents, 0..=5000).logarithmic(true));
+                ui.add(egui::Slider::new(&mut settings.agents, 0..=10000).logarithmic(true));
                 ui.end_row();
                 ui.label("車両数");
                 ui.add(egui::Slider::new(&mut settings.vehicles, 0..=300));

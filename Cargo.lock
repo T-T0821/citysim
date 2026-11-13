@@ -3633,6 +3633,7 @@ dependencies = [
  "anyhow",
  "bevy",
  "bevy_egui",
+ "bytemuck",
  "crowd",
  "js-sys",
  "plateau-fetch",
