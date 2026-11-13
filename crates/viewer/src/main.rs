@@ -5,8 +5,8 @@
 
 mod camera;
 mod evac;
-mod place;
 mod geometry;
+mod place;
 mod scenario;
 mod signals;
 mod ui;
@@ -223,7 +223,8 @@ fn parse_args() -> Result<Args> {
         if let Some(place) = a.place.clone() {
             let p = if a.gml.is_empty() && a.obj.is_empty() {
                 // 入力が無ければ PLATEAU から取得（--data-dir に該当メッシュがあればそれを使う）
-                let r = plateau_fetch::prepare(&place, a.radius, &a.data_dir, &mut |m| info!("{m}"))?;
+                let r =
+                    plateau_fetch::prepare(&place, a.radius, &a.data_dir, &mut |m| info!("{m}"))?;
                 a.gml.extend(r.files);
                 r.place
             } else {
@@ -343,6 +344,7 @@ fn build_sim(
         s.apply_walk_costs(&mut sim.grid);
         sim.recompute_flows();
         sim.closed = vec![false; sim.grid.w * sim.grid.h];
+        sim.curb = s.curb_cells(&sim.grid);
         s.write_closed(t.time, &mut sim.closed);
         t.set_signals(Some(s));
     }
@@ -498,7 +500,9 @@ fn run() -> Result<()> {
         .iter()
         .map(|(n, lat, lon)| (n.clone(), evac::geo_to_local(&state.sim.grid, *lat, *lon)))
         .collect();
-    state.evac_at = (!state.shelters.is_empty()).then_some(args.evacuate_at).flatten();
+    state.evac_at = (!state.shelters.is_empty())
+        .then_some(args.evacuate_at)
+        .flatten();
     let place_ui = place::PlaceUi::new(&state.sim.grid, args.radius as f32, args.data_dir.clone());
 
     let mut app = App::new();
@@ -747,12 +751,7 @@ fn setup(
         })
         .collect();
     // 何千人も並ぶので分割を粗くして頂点数を抑える（既定の 1/10 程度）
-    let body = meshes.add(
-        Capsule3d::new(0.22, 1.2)
-            .mesh()
-            .latitudes(6)
-            .longitudes(12),
-    );
+    let body = meshes.add(Capsule3d::new(0.22, 1.2).mesh().latitudes(6).longitudes(12));
     let visuals = Visuals {
         goal_materials,
         heat_image,

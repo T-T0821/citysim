@@ -307,6 +307,8 @@ pub struct Signals {
 const MERGE_DIST: f32 = 24.0;
 /// 横断歩道の幅（道路方向）[m]
 const CROSSWALK_W: f32 = 4.0;
+/// 信号のある所で、横断歩道以外の車道を歩く経路コスト倍率（乱横断より横断歩道へ回る）
+const MIDBLOCK_COST: f32 = 30.0;
 
 impl Signals {
     /// 道路網と車道セルから信号を置く。`grid.carriageway` が空なら道路端から 3m を歩道とみなす。
@@ -637,11 +639,35 @@ impl Signals {
         }
     }
 
+    /// 歩行者が歩道から踏み込んではいけない車道セル（横断歩道・交差点内以外の車道）。
+    /// 信号が 1 つも無ければ空（制限なし）。`crowd::Simulation::curb` に渡す。
+    pub fn curb_cells(&self, grid: &WalkGrid) -> Vec<bool> {
+        if self.intersections.is_empty() || grid.carriageway.len() != grid.w * grid.h {
+            return vec![];
+        }
+        let mut curb = grid.carriageway.clone();
+        for inter in &self.intersections {
+            let cells = inter.crosswalks.iter().flat_map(|c| &c.cells);
+            for &i in cells.chain(&inter.interior) {
+                curb[i as usize] = false;
+            }
+        }
+        curb
+    }
+
     /// 歩行者の経路コストを信号に合わせる: 横断歩道は渡りやすく、
     /// スクランブル以外の交差点内は斜めに突っ切らないよう高くする。
+    /// 横断歩道以外の車道も高くし、近くに横断歩道があればそちらを回る。
     pub fn apply_walk_costs(&self, grid: &mut WalkGrid) {
         if grid.walk_cost.len() != grid.w * grid.h {
             return;
+        }
+        if !self.intersections.is_empty() && grid.carriageway.len() == grid.w * grid.h {
+            for (c, &cw) in grid.walk_cost.iter_mut().zip(&grid.carriageway) {
+                if cw {
+                    *c = c.max(MIDBLOCK_COST);
+                }
+            }
         }
         for inter in &self.intersections {
             let interior = if inter.plan == Plan::Scramble {

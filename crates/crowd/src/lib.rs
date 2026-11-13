@@ -63,8 +63,11 @@ pub struct Simulation {
     /// 動く障害物（車両など）: カプセルの端点 2 つと半径。毎ステップ外から更新する。
     pub obstacles: Vec<(Vec2, Vec2, f32)>,
     /// 歩道から踏み出してはいけないセル（赤信号の横断歩道など）。空なら制限なし。
-    /// 車道上にいる人（渡っている途中の人）は対象外で、そのまま渡り切る。
+    /// 横断歩道・交差点内で渡っている途中の人は対象外で、そのまま渡り切る。
     pub closed: Vec<bool>,
+    /// 歩道から踏み込んではいけない車道セル（信号のある所では、横断歩道・交差点内以外の車道）。
+    /// 空なら制限なし。経路がそこを通るしかない人（近くに横断歩道が無いなど）だけは渡れる。
+    pub curb: Vec<bool>,
     hash: SpatialHash,
 }
 
@@ -79,6 +82,7 @@ impl Simulation {
             time: 0.0,
             obstacles: vec![],
             closed: vec![],
+            curb: vec![],
             hash,
         }
     }
@@ -105,12 +109,38 @@ impl Simulation {
                 .is_some_and(|(x, y)| self.closed[self.grid.idx(x, y)])
     }
 
-    /// from にいる人が to へ踏み出すのを止めるか（歩道上から閉じたセルへ）
+    /// p のセルが `curb`（横断歩道以外の車道）か
+    fn is_curb(&self, p: Vec2) -> bool {
+        !self.curb.is_empty()
+            && self
+                .grid
+                .cell_of(p)
+                .is_some_and(|(x, y)| self.curb[self.grid.idx(x, y)])
+    }
+
+    /// from にいる人が to へ踏み出せないか（赤信号）: 閉じていないセルから閉じたセルへは入れない。
+    /// 渡っている途中で赤になった人は、閉じたセルの中なのでそのまま渡り切れる。
+    /// 青の横断歩道から赤の交差点内・横断歩道へ踏み込むこともできない。
     fn gated(&self, from: Vec2, to: Vec2) -> bool {
-        !self.closed.is_empty()
-            && !self.grid.is_carriageway(from)
-            && !self.is_closed(from)
-            && self.is_closed(to)
+        !self.closed.is_empty() && self.is_closed(to) && !self.is_closed(from)
+    }
+
+    /// 赤信号の手前で立ち止まって待つか（歩道や横断歩道以外の車道から、閉じたセルへ向かうとき）。
+    /// 青の横断歩道の上では止まらず、閉じたセルの縁に沿って進む。
+    fn waits(&self, from: Vec2, to: Vec2) -> bool {
+        self.gated(from, to) && (!self.grid.is_carriageway(from) || self.is_curb(from))
+    }
+
+    /// 歩道・横断歩道上（from）にいて目的地 goal へ向かう人が to（横断歩道以外の車道）へ踏み出すのを止めるか。
+    /// 押されたり避けたりしても車道へははみ出さない。経路そのものが車道を通る人だけは通す。
+    fn off_curb(&self, goal: usize, from: Vec2, to: Vec2) -> bool {
+        if !self.is_curb(to) || self.is_curb(from) {
+            return false;
+        }
+        match self.goals[goal].next_cell(&self.grid, from) {
+            Some(Some((x, y))) => !self.curb[self.grid.idx(x, y)],
+            _ => true,
+        }
     }
 
     pub fn active(&self) -> usize {
@@ -129,7 +159,7 @@ impl Simulation {
             let ff = &self.goals[a.goal];
             let e = ff.direction(&self.grid, a.pos).unwrap_or(Vec2::ZERO);
             // 赤信号の横断歩道の手前では立ち止まって待つ
-            let speed = if self.gated(a.pos, a.pos + e * (a.radius + 0.5)) {
+            let speed = if self.waits(a.pos, a.pos + e * (a.radius + 0.5)) {
                 0.0
             } else {
                 a.desired_speed
@@ -214,7 +244,7 @@ impl Simulation {
         self.time += dt;
     }
 
-    /// 力 f で 1 ステップ動かす（壁・閉じたセルにはめり込まない）。
+    /// 力 f で 1 ステップ動かす（壁・閉じたセル・横断歩道以外の車道にはめり込まない）。
     fn integrate(&self, a: &mut Agent, f: Vec2, dt: f32) {
         if a.arrived {
             return;
@@ -227,7 +257,10 @@ impl Simulation {
         }
         let next = a.pos + a.vel * dt;
         let from = a.pos;
-        let ok = |q: Vec2| self.grid.is_walkable(q) && !self.gated(from, q);
+        let goal = a.goal;
+        let ok = |q: Vec2| {
+            self.grid.is_walkable(q) && !self.gated(from, q) && !self.off_curb(goal, from, q)
+        };
         // 数値的に壁へめり込んだら軸ごとに止める
         if ok(next) {
             a.pos = next;
