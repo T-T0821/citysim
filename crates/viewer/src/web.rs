@@ -103,3 +103,29 @@ pub fn show_error(msg: &str) {
         let _ = el.set_attribute("class", "error");
     }
 }
+
+/// スマホ・タブレットなど（指で操作する端末か、幅の狭い画面）。描画を軽くするのに使う
+pub fn is_mobile() -> bool {
+    let Some(w) = web_sys::window() else {
+        return false;
+    };
+    let coarse = w
+        .match_media("(pointer: coarse)")
+        .ok()
+        .flatten()
+        .is_some_and(|m| m.matches());
+    let narrow = w
+        .inner_width()
+        .ok()
+        .and_then(|v| v.as_f64())
+        .is_some_and(|x| x < 720.0);
+    coarse || narrow
+}
+
+/// ページの表示領域の縦横比（幅 / 高さ）
+pub fn viewport_aspect() -> Option<f32> {
+    let w = web_sys::window()?;
+    let x = w.inner_width().ok()?.as_f64()?;
+    let y = w.inner_height().ok()?.as_f64()?;
+    (x > 0.0 && y > 0.0).then(|| (x / y) as f32)
+}

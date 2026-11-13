@@ -101,11 +101,119 @@ pub fn install_fonts(ctx: &egui::Context, explicit: Option<&std::path::Path>) {
     ctx.set_fonts(fonts);
 }
 
+/// スマホなど狭い画面向けのタブ（同時に開くのは 1 つだけ）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tab {
+    Settings,
+    Scenario,
+    Tools,
+}
+
+/// 画面の幅に応じたレイアウト。
+/// 幅が狭い（スマホの縦持ちなど）ときは、上のバーのボタンで開くシートに各パネルをまとめる。
+#[derive(Resource, Default)]
+pub struct Layout {
+    pub compact: bool,
+    pub tab: Option<Tab>,
+    /// 広い画面に戻したときに元に戻すための egui の間隔設定
+    saved_spacing: Option<egui::style::Spacing>,
+}
+
+/// これより狭い（egui の論理ピクセル）と狭い画面用のレイアウトにする
+const COMPACT_WIDTH: f32 = 720.0;
+
+impl Layout {
+    /// 狭い画面でこのタブを表示中か
+    pub fn shows(&self, tab: Tab) -> bool {
+        self.compact && self.tab == Some(tab)
+    }
+}
+
+/// 狭い画面では、パネルを画面下のシートとして出す（高さは画面の半分まで、はみ出す分はスクロール）。
+pub fn sheet(ctx: &egui::Context, id: &str, body: impl FnOnce(&mut egui::Ui)) {
+    let max_h = (ctx.screen_rect().height() * 0.5).max(160.0);
+    egui::TopBottomPanel::bottom(id.to_string())
+        .resizable(false)
+        .show(ctx, |ui| {
+            egui::ScrollArea::vertical()
+                .max_height(max_h)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.add_space(4.0);
+                    body(ui);
+                    // 下端はページの出典表示に重なるので空けておく
+                    ui.add_space(24.0);
+                });
+        });
+}
+
+/// 狭い画面かどうかを判定し、狭い画面なら上のバー（再生と各パネルの開閉）を出す。
+pub fn top_bar(
+    mut contexts: EguiContexts,
+    mut layout: ResMut<Layout>,
+    mut state: ResMut<SimState>,
+) {
+    let Some(ctx) = contexts.try_ctx_mut() else {
+        return;
+    };
+    let ctx = ctx.clone();
+    let compact = ctx.screen_rect().width() < COMPACT_WIDTH;
+    if compact != layout.compact {
+        layout.compact = compact;
+        if compact {
+            // 指で押しやすいようにボタン・スライダーを大きくする
+            layout.saved_spacing = Some(ctx.style().spacing.clone());
+            ctx.all_styles_mut(|s| {
+                let sp = &mut s.spacing;
+                sp.interact_size.y = sp.interact_size.y.max(30.0);
+                sp.button_padding = egui::vec2(10.0, 6.0);
+                sp.item_spacing = egui::vec2(8.0, 8.0);
+                sp.slider_width = 150.0;
+                sp.icon_width = 20.0;
+                sp.icon_width_inner = 12.0;
+                sp.combo_height = 300.0;
+            });
+        } else if let Some(sp) = layout.saved_spacing.take() {
+            ctx.all_styles_mut(|s| s.spacing = sp.clone());
+        }
+    }
+    if !compact {
+        return;
+    }
+    egui::TopBottomPanel::top("compact_bar").show(&ctx, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            let label = if state.paused { "▶" } else { "⏸" };
+            if ui.button(label).clicked() {
+                state.paused = !state.paused;
+            }
+            for (tab, name) in [
+                (Tab::Settings, "設定"),
+                (Tab::Scenario, "シナリオ"),
+                (Tab::Tools, "場所・避難"),
+            ] {
+                let on = layout.tab == Some(tab);
+                if ui.selectable_label(on, name).clicked() {
+                    layout.tab = if on { None } else { Some(tab) };
+                }
+            }
+            ui.label(
+                egui::RichText::new(format!(
+                    "{:.0} s · 歩行 {}",
+                    state.sim.time,
+                    state.sim.active()
+                ))
+                .small(),
+            );
+        });
+    });
+}
+
 pub fn settings_panel(
     mut contexts: EguiContexts,
     mut settings: ResMut<Settings>,
     mut state: ResMut<SimState>,
     mut capture: ResMut<UiCapture>,
+    layout: Res<Layout>,
     mut overlay: Query<&mut Visibility, With<crate::HeatOverlay>>,
 ) {
     let Some(ctx) = contexts.try_ctx_mut() else {
@@ -113,12 +221,13 @@ pub fn settings_panel(
     };
     let ctx = ctx.clone();
 
-    let resp = egui::SidePanel::right("settings")
-        .default_width(260.0)
-        .show(&ctx, |ui| {
-            ui.heading("シミュレーション設定");
-            ui.add_space(4.0);
-            egui::Grid::new("params").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+    let body = |ui: &mut egui::Ui| {
+        ui.heading("シミュレーション設定");
+        ui.add_space(4.0);
+        egui::Grid::new("params")
+            .num_columns(2)
+            .spacing([8.0, 6.0])
+            .show(ui, |ui| {
                 ui.label("歩行者数");
                 ui.add(egui::Slider::new(&mut settings.agents, 0..=5000).logarithmic(true));
                 ui.end_row();
@@ -129,7 +238,9 @@ pub fn settings_panel(
                 ui.add(egui::Slider::new(&mut settings.walk_speed, 0.6..=2.0).suffix(" m/s"));
                 ui.end_row();
                 ui.label("制限速度");
-                ui.add(egui::Slider::new(&mut settings.speed_limit_kmh, 10.0..=80.0).suffix(" km/h"));
+                ui.add(
+                    egui::Slider::new(&mut settings.speed_limit_kmh, 10.0..=80.0).suffix(" km/h"),
+                );
                 ui.end_row();
                 ui.label("乱数シード");
                 ui.add(egui::DragValue::new(&mut settings.seed));
@@ -138,46 +249,64 @@ pub fn settings_panel(
                 ui.checkbox(&mut settings.respawn, "");
                 ui.end_row();
             });
-            ui.add_space(4.0);
-            signal_settings(ui, &mut settings);
-            ui.add_space(6.0);
-            if ui
-                .add_sized([ui.available_width(), 28.0], egui::Button::new("適用して最初から"))
-                .clicked()
-            {
+        ui.add_space(4.0);
+        signal_settings(ui, &mut settings);
+        ui.add_space(6.0);
+        if ui
+            .add_sized(
+                [ui.available_width(), 28.0],
+                egui::Button::new("適用して最初から"),
+            )
+            .clicked()
+        {
+            settings.apply_requested = true;
+        }
+        ui.small("人数・台数・速度・シード・信号は「適用」で作り直したときに反映されます。");
+
+        ui.separator();
+        ui.heading("再生");
+        ui.horizontal(|ui| {
+            let label = if state.paused {
+                "▶ 再開"
+            } else {
+                "⏸ 一時停止"
+            };
+            if ui.button(label).clicked() {
+                state.paused = !state.paused;
+            }
+            if ui.button("⟲ 時刻 0 に戻す").clicked() {
                 settings.apply_requested = true;
             }
-            ui.small("人数・台数・速度・シード・信号は「適用」で作り直したときに反映されます。");
-
-            ui.separator();
-            ui.heading("再生");
-            ui.horizontal(|ui| {
-                let label = if state.paused { "▶ 再開" } else { "⏸ 一時停止" };
-                if ui.button(label).clicked() {
-                    state.paused = !state.paused;
-                }
-                if ui.button("⟲ 時刻 0 に戻す").clicked() {
-                    settings.apply_requested = true;
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("再生速度");
-                ui.add(egui::Slider::new(&mut state.speed, 0.25..=16.0).logarithmic(true).suffix("x"));
-            });
-            let mut show_heat = overlay.iter().any(|v| *v != Visibility::Hidden);
-            if ui.checkbox(&mut show_heat, "通行量ヒートマップ").changed() {
-                for mut v in &mut overlay {
-                    *v = if show_heat { Visibility::Visible } else { Visibility::Hidden };
-                }
-                state.heat_dirty = true;
+        });
+        ui.horizontal(|ui| {
+            ui.label("再生速度");
+            ui.add(
+                egui::Slider::new(&mut state.speed, 0.25..=16.0)
+                    .logarithmic(true)
+                    .suffix("x"),
+            );
+        });
+        let mut show_heat = overlay.iter().any(|v| *v != Visibility::Hidden);
+        if ui.checkbox(&mut show_heat, "通行量ヒートマップ").changed() {
+            for mut v in &mut overlay {
+                *v = if show_heat {
+                    Visibility::Visible
+                } else {
+                    Visibility::Hidden
+                };
             }
-            state.respawn = settings.respawn;
+            state.heat_dirty = true;
+        }
+        state.respawn = settings.respawn;
 
-            ui.separator();
-            ui.heading("状態");
-            let walking = state.sim.active();
-            let total = state.sim.agents.len();
-            egui::Grid::new("status").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+        ui.separator();
+        ui.heading("状態");
+        let walking = state.sim.active();
+        let total = state.sim.agents.len();
+        egui::Grid::new("status")
+            .num_columns(2)
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
                 ui.label("時刻");
                 ui.label(format!("{:.1} s", state.sim.time));
                 ui.end_row();
@@ -185,38 +314,76 @@ pub fn settings_panel(
                 ui.label(format!("{} / {}", walking, total - walking));
                 ui.end_row();
                 ui.label("走行中の車");
-                ui.label(format!("{}", state.traffic.as_ref().map_or(0, |t| t.active())));
+                ui.label(format!(
+                    "{}",
+                    state.traffic.as_ref().map_or(0, |t| t.active())
+                ));
                 ui.end_row();
                 ui.label("歩行者の平均速度");
                 let n = walking.max(1) as f32;
-                let v: f32 = state.sim.agents.iter().filter(|a| !a.arrived).map(|a| a.vel.length()).sum::<f32>() / n;
+                let v: f32 = state
+                    .sim
+                    .agents
+                    .iter()
+                    .filter(|a| !a.arrived)
+                    .map(|a| a.vel.length())
+                    .sum::<f32>()
+                    / n;
                 ui.label(format!("{v:.2} m/s"));
                 ui.end_row();
                 if let Some(s) = state.traffic.as_ref().and_then(|t| t.signals.as_ref()) {
                     ui.label("信号のある交差点");
-                    let scr = s.intersections.iter().filter(|i| i.plan == traffic::signal::Plan::Scramble).count();
-                    ui.label(format!("{} か所（スクランブル {}）", s.intersections.len(), scr));
+                    let scr = s
+                        .intersections
+                        .iter()
+                        .filter(|i| i.plan == traffic::signal::Plan::Scramble)
+                        .count();
+                    ui.label(format!(
+                        "{} か所（スクランブル {}）",
+                        s.intersections.len(),
+                        scr
+                    ));
                     ui.end_row();
                 }
                 if let Some(t) = &state.traffic {
                     ui.label("車の平均速度");
                     let n = t.active().max(1) as f32;
-                    let v: f32 = t.vehicles.iter().filter(|v| v.active).map(|v| v.v).sum::<f32>() / n * 3.6;
+                    let v: f32 = t
+                        .vehicles
+                        .iter()
+                        .filter(|v| v.active)
+                        .map(|v| v.v)
+                        .sum::<f32>()
+                        / n
+                        * 3.6;
                     ui.label(format!("{v:.1} km/h"));
                     ui.end_row();
                 }
             });
-            ui.add_space(8.0);
-            ui.small("左ドラッグ: 回転 / 右ドラッグ: 移動 / ホイール: ズーム\nSpace: 一時停止  ↑↓: 再生速度  H: ヒートマップ");
-        });
+        ui.add_space(8.0);
+        if layout.compact {
+            ui.small("1 本指ドラッグ: 回転 / 2 本指: 移動・ピンチでズーム");
+        } else {
+            ui.small("左ドラッグ: 回転 / 右ドラッグ: 移動 / ホイール: ズーム\nSpace: 一時停止  ↑↓: 再生速度  H: ヒートマップ\n1 本指ドラッグ: 回転 / 2 本指: 移動・ピンチでズーム");
+        }
+    };
 
-    if std::env::var_os("PLATEAU_UI_DEBUG").is_some() {
-        info!(
-            "panel rect {:?} screen {:?} pixels_per_point {}",
-            resp.response.rect,
-            ctx.screen_rect(),
-            ctx.pixels_per_point()
-        );
+    if layout.compact {
+        if layout.shows(Tab::Settings) {
+            sheet(&ctx, "settings_sheet", body);
+        }
+    } else {
+        let resp = egui::SidePanel::right("settings")
+            .default_width(260.0)
+            .show(&ctx, body);
+        if std::env::var_os("PLATEAU_UI_DEBUG").is_some() {
+            info!(
+                "panel rect {:?} screen {:?} pixels_per_point {}",
+                resp.response.rect,
+                ctx.screen_rect(),
+                ctx.pixels_per_point()
+            );
+        }
     }
     capture.0 = ctx.wants_pointer_input() || ctx.is_pointer_over_area();
 }

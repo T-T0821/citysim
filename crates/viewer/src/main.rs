@@ -5,8 +5,8 @@
 
 mod camera;
 mod evac;
-mod place;
 mod geometry;
+mod place;
 mod scenario;
 mod signals;
 mod ui;
@@ -223,7 +223,8 @@ fn parse_args() -> Result<Args> {
         if let Some(place) = a.place.clone() {
             let p = if a.gml.is_empty() && a.obj.is_empty() {
                 // 入力が無ければ PLATEAU から取得（--data-dir に該当メッシュがあればそれを使う）
-                let r = plateau_fetch::prepare(&place, a.radius, &a.data_dir, &mut |m| info!("{m}"))?;
+                let r =
+                    plateau_fetch::prepare(&place, a.radius, &a.data_dir, &mut |m| info!("{m}"))?;
                 a.gml.extend(r.files);
                 r.place
             } else {
@@ -430,6 +431,18 @@ fn main() {
     }
 }
 
+/// スマホなど描画を軽くしたい端末か（Web 版だけ判定する）
+fn is_mobile() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    return web::is_mobile();
+    #[cfg(not(target_arch = "wasm32"))]
+    false
+}
+
+/// スマホで人数・台数を指定しなかったときの上限（描画と計算を軽くする）
+const MOBILE_AGENTS: usize = 400;
+const MOBILE_VEHICLES: usize = 40;
+
 fn run() -> Result<()> {
     let args = parse_args()?;
     let (model, bounds) = load_model(&args)?;
@@ -440,6 +453,8 @@ fn run() -> Result<()> {
     );
     let grid = WalkGrid::from_city_bounds(&model, args.cell, bounds)
         .context("座標を含む地物がありません")?;
+    // 以降は使わない。Web 版は app.run() から戻らないので、ここで明示的に手放してメモリを空ける
+    drop(model);
     let road_graph = grid.has_roads.then(|| {
         let net = RoadGraph::from_grid(&grid, crowd::scenario::SIDEWALK_W);
         info!(
@@ -463,6 +478,14 @@ fn run() -> Result<()> {
         }
         None => crowd::event::Scenario::empty(),
     };
+    if is_mobile() {
+        if !args.agents_given {
+            settings.agents = settings.agents.min(MOBILE_AGENTS);
+        }
+        if !args.vehicles_given {
+            settings.vehicles = settings.vehicles.min(MOBILE_VEHICLES);
+        }
+    }
     settings.signals = args.signals.is_some();
     if let Some(c) = &args.signals {
         settings.signal = c.clone();
@@ -498,7 +521,9 @@ fn run() -> Result<()> {
         .iter()
         .map(|(n, lat, lon)| (n.clone(), evac::geo_to_local(&state.sim.grid, *lat, *lon)))
         .collect();
-    state.evac_at = (!state.shelters.is_empty()).then_some(args.evacuate_at).flatten();
+    state.evac_at = (!state.shelters.is_empty())
+        .then_some(args.evacuate_at)
+        .flatten();
     let place_ui = place::PlaceUi::new(&state.sim.grid, args.radius as f32, args.data_dir.clone());
 
     let mut app = App::new();
@@ -525,6 +550,7 @@ fn run() -> Result<()> {
     .insert_resource(scen)
     .insert_resource(UiFont(args.ui_font.clone()))
     .init_resource::<camera::UiCapture>()
+    .init_resource::<ui::Layout>()
     .add_plugins(bevy_egui::EguiPlugin {
         enable_multipass_for_primary_context: false,
     })
@@ -533,6 +559,7 @@ fn run() -> Result<()> {
         Update,
         (
             install_ui_font,
+            ui::top_bar,
             evac::tools_window,
             ui::settings_panel,
             evac::pick_shelter,
@@ -747,12 +774,7 @@ fn setup(
         })
         .collect();
     // 何千人も並ぶので分割を粗くして頂点数を抑える（既定の 1/10 程度）
-    let body = meshes.add(
-        Capsule3d::new(0.22, 1.2)
-            .mesh()
-            .latitudes(6)
-            .longitudes(12),
-    );
+    let body = meshes.add(Capsule3d::new(0.22, 1.2).mesh().latitudes(6).longitudes(12));
     let visuals = Visuals {
         goal_materials,
         heat_image,
@@ -783,13 +805,19 @@ fn setup(
     commands.spawn((
         DirectionalLight {
             illuminance: 9000.0,
-            shadows_enabled: true,
+            // スマホでは影を切って描画を軽くする
+            shadows_enabled: !is_mobile(),
             ..default()
         },
         Transform::from_xyz(-0.6, 1.0, 0.4).looking_at(Vec3::ZERO, Vec3::Y),
     ));
     let mut target = to_world(center, 0.0);
     let mut dist = size.max_element().max(60.0) * 1.5;
+    // 縦長の画面（スマホの縦持ち）では左右が切れないように引いて見る
+    #[cfg(target_arch = "wasm32")]
+    if let Some(a) = web::viewport_aspect().filter(|a| *a < 1.0) {
+        dist /= a.max(0.45);
+    }
     let (mut yaw, mut pitch) = (-0.6, 0.9);
     // 確認用: PLATEAU_CAM="yaw,pitch,距離,x,y"（x,y は局所座標 [m]）でカメラ初期位置を指定
     if let Ok(c) = std::env::var("PLATEAU_CAM") {
@@ -800,6 +828,12 @@ fn setup(
     }
     commands.spawn((
         Camera3d::default(),
+        // スマホではアンチエイリアスを切って描画を軽くする
+        if is_mobile() {
+            Msaa::Off
+        } else {
+            Msaa::default()
+        },
         camera::OrbitCamera {
             target,
             yaw,
@@ -1333,9 +1367,19 @@ fn update_heat(
     }
 }
 
-fn update_hud(state: Res<SimState>, mut q: Query<&mut Text, With<Hud>>) {
+fn update_hud(
+    state: Res<SimState>,
+    layout: Res<ui::Layout>,
+    mut q: Query<(&mut Text, &mut Visibility), With<Hud>>,
+) {
     let active = state.sim.active();
-    for mut t in &mut q {
+    for (mut t, mut vis) in &mut q {
+        // 狭い画面では上のバーに時刻と人数を出すので隠す
+        vis.set_if_neq(if layout.compact {
+            Visibility::Hidden
+        } else {
+            Visibility::Inherited
+        });
         **t = format!(
             "t = {:6.1} s   walking {}/{}   cars {}   speed x{}{}\n\
              LMB rotate / RMB pan / wheel zoom   [Space] pause  [Up/Down] speed  [H] heatmap",

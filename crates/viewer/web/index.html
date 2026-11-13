@@ -2,13 +2,19 @@
 <html lang="ja">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#1b1b1b">
   <title>PLATEAU 人流シミュレーター Web デモ</title>
   <meta name="description" content="Project PLATEAU の 3D 都市モデル（銀座 4 丁目交差点）上で歩行者・車・バス・自転車と信号をブラウザでシミュレーションするデモ">
   <style>
     html, body { margin: 0; height: 100%; background: #9eb8d1; overflow: hidden;
       font-family: system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; }
-    #bevy { display: block; width: 100%; height: 100%; outline: none; }
+    /* 指の操作（ピンチ・ドラッグ）はページのズームやスクロールではなく 3D 表示の操作に使う */
+    html, body { overscroll-behavior: none; touch-action: none; -webkit-user-select: none; user-select: none;
+      -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
+    /* スマホのアドレスバーの出入りで高さが変わっても全体に収める */
+    html, body { height: 100dvh; }
+    #bevy { display: block; width: 100%; height: 100%; outline: none; touch-action: none; }
     #status { position: fixed; inset: 0; display: flex; flex-direction: column; gap: 12px;
       align-items: center; justify-content: center; text-align: center; padding: 16px;
       color: #10202e; font-size: 16px; pointer-events: none; }
@@ -20,6 +26,13 @@
     #about { position: fixed; left: 0; bottom: 0; padding: 2px 8px; font-size: 11px;
       color: #e8eef4; background: #1b1b1bcc; border-top-right-radius: 4px; }
     #about a { color: inherit; }
+    /* 狭い画面では出典を短く小さくする（画面下のパネルは下端をこの分だけ空けてある） */
+    #about .short { display: none; }
+    @media (max-width: 719px) {
+      #about { font-size: 10px; padding: 1px 6px; margin-bottom: env(safe-area-inset-bottom); }
+      #about .long { display: none; }
+      #about .short { display: inline; }
+    }
   </style>
 </head>
 <body>
@@ -28,10 +41,11 @@
     <div class="spinner"></div>
     <div>銀座 4 丁目交差点を読み込んでいます…</div>
     <small>3D 都市モデルから歩行空間・道路網・信号を作るので、数秒〜十数秒かかります。<br>
-      WebGL2 に対応したブラウザ（PC の Chrome / Edge / Firefox / Safari）で開いてください。</small>
+      WebGL2 に対応したブラウザ（Chrome / Edge / Firefox / Safari）で開いてください。スマホでも動きます。</small>
   </div>
   <div id="about">
-    出典: 国土交通省 Project PLATEAU 3D 都市モデル（東京都 23 区, 2023 年度）を加工 ·
+    <span class="long">出典: 国土交通省 Project PLATEAU 3D 都市モデル（東京都 23 区, 2023 年度）を加工 ·</span>
+    <span class="short">出典: PLATEAU（国交省）·</span>
     <a href="https://github.com/T-T0821/citysim" target="_blank" rel="noopener">ソースコード</a>
   </div>
   <script type="module">
