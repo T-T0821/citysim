@@ -5,6 +5,7 @@
 
 mod camera;
 mod evac;
+mod person;
 mod place;
 mod geometry;
 mod scenario;
@@ -372,13 +373,9 @@ fn build_sim(
 
 #[derive(Resource)]
 struct Visuals {
-    goal_materials: Vec<Handle<StandardMaterial>>,
     heat_image: Handle<Image>,
-    body: Handle<Mesh>,
     car_mats: Vec<Handle<StandardMaterial>>,
     glass: Handle<StandardMaterial>,
-    /// 避難中の歩行者
-    evac_mat: Handle<StandardMaterial>,
     bus_mat: Handle<StandardMaterial>,
     bike_mat: Handle<StandardMaterial>,
 }
@@ -738,32 +735,15 @@ fn setup(
         Color::srgb(0.95, 0.45, 0.70),
         Color::srgb(0.55, 0.35, 0.15),
     ];
-    let goal_materials: Vec<_> = (0..palette.len())
-        .map(|i| {
-            materials.add(StandardMaterial {
-                base_color: palette[i],
-                ..default()
-            })
-        })
-        .collect();
-    // 何千人も並ぶので分割を粗くして頂点数を抑える（既定の 1/10 程度）
-    let body = meshes.add(
-        Capsule3d::new(0.22, 1.2)
-            .mesh()
-            .latitudes(6)
-            .longitudes(12),
+    let mut people = person::PersonMeshes::new(
+        &mut materials,
+        palette.to_vec(),
+        Color::srgb(0.10, 0.95, 0.55),
     );
     let visuals = Visuals {
-        goal_materials,
         heat_image,
-        body,
         car_mats,
         glass,
-        evac_mat: materials.add(StandardMaterial {
-            base_color: Color::srgb(0.10, 0.95, 0.55),
-            emissive: LinearRgba::rgb(0.0, 0.25, 0.1),
-            ..default()
-        }),
         bus_mat: materials.add(StandardMaterial {
             base_color: Color::srgb(0.15, 0.55, 0.35),
             perceptual_roughness: 0.4,
@@ -774,7 +754,8 @@ fn setup(
             ..default()
         }),
     };
-    spawn_entities(&mut commands, &mut meshes, &visuals, &state);
+    spawn_entities(&mut commands, &mut meshes, &visuals, &mut people, &state);
+    commands.insert_resource(people);
     let signal_mats = signals::SignalMats::new(&mut meshes, &mut materials);
     signals::spawn(&mut commands, &mut meshes, &signal_mats, &state);
     commands.insert_resource(signal_mats);
@@ -833,15 +814,11 @@ fn spawn_entities(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     visuals: &Visuals,
+    people: &mut person::PersonMeshes,
     state: &SimState,
 ) {
     for (i, a) in state.sim.agents.iter().enumerate() {
-        commands.spawn((
-            AgentVis(i),
-            Mesh3d(visuals.body.clone()),
-            MeshMaterial3d(visuals.agent_mat(a.goal, state.evac_goals())),
-            Transform::from_translation(to_world(a.pos, 0.82)),
-        ));
+        commands.spawn(agent_bundle(meshes, people, i, a));
     }
     let Some(t) = &state.traffic else { return };
     for (i, v) in t.vehicles.iter().enumerate() {
@@ -897,18 +874,34 @@ fn spawn_entities(
     }
 }
 
-impl Visuals {
-    /// 歩行者の色: 避難中は避難色、それ以外は目的地ごと（シナリオの目的地は色を巡回）
-    fn agent_mat(
-        &self,
-        goal: usize,
-        evac: Option<std::ops::Range<usize>>,
-    ) -> Handle<StandardMaterial> {
-        if evac.is_some_and(|r| r.contains(&goal)) {
-            return self.evac_mat.clone();
-        }
-        self.goal_materials[goal % self.goal_materials.len()].clone()
-    }
+/// 歩行者 1 人の表示。メッシュ（服装と姿勢）は `sync_agents` が毎フレーム選び直す。
+fn agent_bundle(
+    meshes: &mut Assets<Mesh>,
+    people: &mut person::PersonMeshes,
+    i: usize,
+    a: &crowd::Agent,
+) -> impl Bundle {
+    let look = person::look_of(i);
+    let gait = person::Gait::new(a.pos, a.vel, i);
+    let key = person::Key {
+        top: person::Top::Cloth(look.top),
+        lower: look.lower,
+        phase: 0,
+    };
+    (
+        AgentVis(i),
+        Mesh3d(people.get(meshes, key)),
+        MeshMaterial3d(people.material.clone()),
+        Transform::from_translation(to_world(a.pos, 0.0))
+            .with_rotation(gait.rotation())
+            .with_scale(look.scale),
+        gait,
+        if a.arrived {
+            Visibility::Hidden
+        } else {
+            Visibility::Inherited
+        },
+    )
 }
 
 /// バス: 低床の長い車体に窓の帯。
@@ -999,6 +992,7 @@ fn apply_settings(
     mut state: ResMut<SimState>,
     mut scen: ResMut<scenario::ScenarioState>,
     visuals: Res<Visuals>,
+    mut people: ResMut<person::PersonMeshes>,
     signal_mats: Res<signals::SignalMats>,
     agents: Query<Entity, With<AgentVis>>,
     cars: Query<Entity, With<CarVis>>,
@@ -1031,7 +1025,7 @@ fn apply_settings(
     for e in agents.iter().chain(cars.iter()).chain(signal_ents.iter()) {
         commands.entity(e).despawn();
     }
-    spawn_entities(&mut commands, &mut meshes, &visuals, st);
+    spawn_entities(&mut commands, &mut meshes, &visuals, &mut people, st);
     signals::spawn(&mut commands, &mut meshes, &signal_mats, st);
     info!(
         "作り直し: 歩行者 {} 人, 車 {} 台",
@@ -1215,36 +1209,32 @@ fn respawn_arrived(st: &mut SimState, limit: usize) {
 fn spawn_new_agents(
     mut commands: Commands,
     state: Res<SimState>,
-    visuals: Res<Visuals>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut people: ResMut<person::PersonMeshes>,
     q: Query<&AgentVis>,
 ) {
     let have = q.iter().count();
     for (i, a) in state.sim.agents.iter().enumerate().skip(have) {
-        commands.spawn((
-            AgentVis(i),
-            Mesh3d(visuals.body.clone()),
-            MeshMaterial3d(visuals.goal_materials[a.goal % visuals.goal_materials.len()].clone()),
-            Transform::from_translation(to_world(a.pos, 0.82)),
-            if a.arrived {
-                Visibility::Hidden
-            } else {
-                Visibility::Inherited
-            },
-        ));
+        commands.spawn(agent_bundle(&mut meshes, &mut people, i, a));
     }
 }
 
 fn sync_agents(
     state: Res<SimState>,
-    visuals: Res<Visuals>,
+    settings: Res<Settings>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut people: ResMut<person::PersonMeshes>,
     mut q: Query<(
         &AgentVis,
+        &mut person::Gait,
         &mut Transform,
         &mut Visibility,
-        &mut MeshMaterial3d<StandardMaterial>,
+        &mut Mesh3d,
     )>,
 ) {
-    for (AgentVis(i), mut tf, mut vis, mut mat) in &mut q {
+    let evac = state.evac_goals();
+    let n_goals = people.goal_count();
+    for (AgentVis(i), mut gait, mut tf, mut vis, mut mesh) in &mut q {
         let Some(a) = state.sim.agents.get(*i) else {
             continue;
         };
@@ -1256,14 +1246,34 @@ fn sync_agents(
         if *vis != want {
             *vis = want;
         }
-        // 変わらないものに書き込むと変更扱いになり、変換の伝播・GPU 転送が毎フレーム走る
-        let t = to_world(a.pos, 0.82);
-        if !a.arrived && tf.translation != t {
-            tf.translation = t;
+        if a.arrived {
+            gait.prev = a.pos;
+            continue;
         }
-        let want = visuals.agent_mat(a.goal, state.evac_goals());
-        if mat.0 != want {
-            mat.0 = want;
+        let phase = gait.advance(a.pos, a.vel);
+        let look = person::look_of(*i);
+        let top = if evac.as_ref().is_some_and(|r| r.contains(&a.goal)) {
+            person::Top::Evac
+        } else if settings.color_by_goal {
+            person::Top::Goal((a.goal % n_goals) as u8)
+        } else {
+            person::Top::Cloth(look.top)
+        };
+        let key = person::Key {
+            top,
+            lower: look.lower,
+            phase,
+        };
+        // 変わらないものに書き込むと変更扱いになり、変換の伝播・GPU 転送が毎フレーム走る
+        if gait.key != Some(key) {
+            gait.key = Some(key);
+            mesh.0 = people.get(&mut meshes, key);
+        }
+        let t = to_world(a.pos, 0.0);
+        let r = gait.rotation();
+        if tf.translation != t || tf.rotation != r {
+            tf.translation = t;
+            tf.rotation = r;
         }
     }
 }
