@@ -129,15 +129,15 @@ impl Layout {
     }
 }
 
-/// 狭い画面では、パネルを画面下のシートとして出す（高さは画面の半分まで、はみ出す分はスクロール）。
+/// 狭い画面では、パネルを画面下のシートとして出す（高さは画面の 45%、はみ出す分はスクロール）。
 pub fn sheet(ctx: &egui::Context, id: &str, body: impl FnOnce(&mut egui::Ui)) {
-    let max_h = (ctx.screen_rect().height() * 0.5).max(160.0);
+    let h = (ctx.screen_rect().height() * 0.45).max(160.0);
     egui::TopBottomPanel::bottom(id.to_string())
         .resizable(false)
+        .exact_height(h)
         .show(ctx, |ui| {
             egui::ScrollArea::vertical()
-                .max_height(max_h)
-                .auto_shrink([false, true])
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.add_space(4.0);
                     body(ui);
