@@ -190,7 +190,8 @@ fn parse_args() -> Result<Args> {
     if let Some(place) = a.place.clone() {
         let p = if a.gml.is_empty() && a.obj.is_empty() {
             // 入力が無ければ PLATEAU から取得（手元の --data-dir にあればそれを使う）
-            let r = plateau_fetch::prepare(&place, a.radius, &a.data_dir, &mut |m| eprintln!("{m}"))?;
+            let r =
+                plateau_fetch::prepare(&place, a.radius, &a.data_dir, &mut |m| eprintln!("{m}"))?;
             a.gml.extend(r.files);
             r.place
         } else {
@@ -498,6 +499,7 @@ fn simulate(
         s.apply_walk_costs(&mut sim.grid);
         sim.recompute_flows();
         sim.closed = vec![false; sim.grid.w * sim.grid.h];
+        sim.curb = s.curb_cells(&sim.grid);
         t.set_signals(Some(s));
     }
     if let Some(p) = map_png {
@@ -596,12 +598,9 @@ fn simulate(
         }
         if let (Some(at), None) = (evacuate_at, &evac) {
             if sim.time + 1e-4 >= at {
-                let ev = crowd::evacuation::Evacuation::start(
-                    &mut sim,
-                    &shelters,
-                    &Default::default(),
-                )
-                .context("避難所の近くに歩行空間がありません（範囲外か建物の中）")?;
+                let ev =
+                    crowd::evacuation::Evacuation::start(&mut sim, &shelters, &Default::default())
+                        .context("避難所の近くに歩行空間がありません（範囲外か建物の中）")?;
                 eprintln!(
                     "避難開始: t={:.1}s, 対象 {} 人, 避難所 {} か所{}",
                     sim.time,
