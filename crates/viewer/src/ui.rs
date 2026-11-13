@@ -19,6 +19,8 @@ pub struct Settings {
     /// 信号機を置くか（オフなら交差点は先着順）
     pub signals: bool,
     pub signal: traffic::SignalConfig,
+    /// 歩行者の上着を目的地ごとの色にする（オフなら普段の服の色）
+    pub color_by_goal: bool,
     /// 「適用」が押された
     pub apply_requested: bool,
 }
@@ -34,6 +36,7 @@ impl Settings {
             seed,
             signals: true,
             signal: traffic::SignalConfig::default(),
+            color_by_goal: false,
             apply_requested: false,
         }
     }
@@ -297,6 +300,7 @@ pub fn settings_panel(
             }
             state.heat_dirty = true;
         }
+        ui.checkbox(&mut settings.color_by_goal, "歩行者の服を目的地で色分け");
         state.respawn = settings.respawn;
 
         ui.separator();
