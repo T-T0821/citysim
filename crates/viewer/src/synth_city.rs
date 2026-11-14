@@ -24,7 +24,7 @@ impl Axis {
         let mut blocks = vec![];
         let street = |k: usize, rng: &mut Rng| -> f32 {
             // 4 本に 1 本は広い大通り
-            if k % 4 == 0 {
+            if k.is_multiple_of(4) {
                 rng.range(20.0, 27.0).round()
             } else {
                 rng.range(10.0, 16.0).round()

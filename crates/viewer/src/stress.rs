@@ -6,10 +6,14 @@
 //! （WebGL2 には計算シェーダーが無いので、フラグメントシェーダーで 1 テクセル = 1 人を計算する）。
 //! 描画も同じテクスチャから位置を読むので、CPU と GPU の間で毎フレーム送るデータは無い。
 //!
-//! 単純化している点:
-//! - 歩行者モデルは crowd::Model::Lite と同じ密度場の近似（すれ違いの細かな避け合いは無い）
+//! 歩行者モデルは銀座のデモ（2 万人以下）と同じ crowd::Model::Full（Social Force Model）で、
+//! 近傍は GPU 上の近傍表（2m マスごとに最大 8 人）から引く。`?model=lite` で密度場の軽量モデルにもできる。
+//! 人の見た目も銀座と同じ人型（近く: 歩く人型 / 遠く: 箱 5 つ）で、身長数ピクセル以下の遠方だけ箱 1 つにする。
+//!
+//! 銀座と違う点:
 //! - 車・信号・シナリオは無し。目的地は街の東西南北の端で、着いたら別の端から入り直す
-//! - 人の形は箱 1 つ（歩く姿勢なし）
+//! - 行き先への向きはフローフィールドの代わりに、格子状の街路から式で求める
+//! - 近傍表に入りきらない人（2m マスに 9 人目以降。4.5 人/m² 超の大混雑）は他の人を押さない
 
 use std::borrow::Cow;
 
@@ -58,14 +62,29 @@ pub const MAX_AGENTS: usize = (TEX * TEX) as usize;
 /// 既定の人数（PC / スマホ）
 const DEFAULT_AGENTS: usize = 1_000_000;
 const DEFAULT_AGENTS_MOBILE: usize = 100_000;
-/// 1 ステップの最大の時間 [s]（これより長いフレームでは計算を遅らせる）
-const MAX_DT: f32 = 0.1;
+/// 1 ステップの最大の時間 [s]（これより長いフレームでは計算を遅らせる）。銀座のデモと同じ刻み
+const MAX_DT_FULL: f32 = 0.05;
+const MAX_DT_LITE: f32 = 0.1;
+/// 近傍表のマスの大きさ [m] と一辺のマス数（stress_sim.wgsl と同じ）
+const CELL: f32 = 2.0;
+const GRID: u32 = 1024;
+/// 近傍表の 1 マスに入る人数
+const SLOTS: usize = 8;
+/// 画面上の身長がこれ [px] より小さい人は箱 5 つの簡易な人型（銀座の FAR_PERSON_PX と同じ）
+const FAR_PERSON_PX: f32 = 24.0;
+/// さらにこれより小さい人は箱 1 つ
+const TINY_PERSON_PX: f32 = 8.0;
+/// 歩く人型・箱 5 つで描く範囲の上限（マス数の半分）。頂点処理の量を抑える
+const MAX_NEAR_HALF: i32 = 48;
+const MAX_MID_HALF: i32 = 128;
 
 pub struct StressArgs {
     pub agents: Option<usize>,
     pub seed: u64,
     pub speed: f32,
     pub mobile: bool,
+    /// 密度場の軽量モデルにする（既定は銀座と同じ Social Force Model）
+    pub lite: bool,
 }
 
 /// 負荷テストモードのアプリを動かす（Web 版は戻らない）
@@ -116,9 +135,13 @@ pub fn run(args: StressArgs) {
         speed: args.speed,
         paused: false,
         mobile: args.mobile,
+        lite: args.lite,
         fps: 0.0,
         sim_rate: 0.0,
         log_in: 2.0,
+        cam_cell: (0, 0),
+        near_half: -1,
+        mid_half: -1,
     })
     .insert_resource(CityRes(city))
     .insert_resource(SeedRes(args.seed))
@@ -135,6 +158,7 @@ pub fn run(args: StressArgs) {
             crate::camera::orbit_camera,
             keys,
             advance,
+            lod_ranges,
         )
             .chain(),
     );
@@ -162,16 +186,26 @@ pub struct StressSim {
     pub speed: f32,
     pub paused: bool,
     pub mobile: bool,
+    pub lite: bool,
     pub fps: f32,
     pub sim_rate: f32,
     log_in: f32,
+    /// カメラの真下の近傍表のマスと、歩く人型・箱 5 つで描く正方形の範囲（マス数の半分。-1 は無し）
+    pub cam_cell: (i32, i32),
+    pub near_half: i32,
+    pub mid_half: i32,
 }
 
 /// GPU 側のテクスチャ（メインワールドで Image として作り、描画側では GpuImage を引く）
 #[derive(Resource, Clone, ExtractResource)]
 pub struct StressImages {
     state: [Handle<Image>; 2],
+    /// 歩行の位相・向き・近傍表を作ったときのマス（状態と一緒に入れ替える）
+    aux: [Handle<Image>; 2],
+    /// 目的地, 希望速度, 人ごとの乱数, 半径
     attr: Handle<Image>,
+    /// 見た目（person::look_of）: 横幅・身長の倍率, 上着, 下の組み合わせ
+    look: Handle<Image>,
     density: Handle<Image>,
     axis: Handle<Image>,
     blocks: Handle<Image>,
@@ -182,16 +216,23 @@ pub struct StressImages {
     nbands_y: u32,
 }
 
-/// 人を描くエンティティの目印
-#[derive(Component, Clone, Default)]
-pub struct StressPeople;
+/// 人を描くエンティティ（遠さの段階ごとに 1 つ）
+#[derive(Component, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum StressPeople {
+    /// 歩く人型（近く）
+    Near,
+    /// 箱 5 つ
+    Mid,
+    /// 箱 1 つ（全員を描き、上の 2 つで描いた人は潰す）
+    Distant,
+}
 
 impl ExtractComponent for StressPeople {
-    type QueryData = ();
-    type QueryFilter = With<StressPeople>;
+    type QueryData = &'static StressPeople;
+    type QueryFilter = ();
     type Out = Self;
-    fn extract_component(_: QueryItem<'_, Self::QueryData>) -> Option<Self> {
-        Some(StressPeople)
+    fn extract_component(item: QueryItem<'_, Self::QueryData>) -> Option<Self> {
+        Some(*item)
     }
 }
 
@@ -237,14 +278,27 @@ fn setup(
     let mut rng = crowd::Rng::new(seed.0 ^ 0xA77);
     let mut state = vec![[0.0f32; 4]; MAX_AGENTS];
     let mut attr = vec![[0.0f32; 4]; MAX_AGENTS];
+    let mut aux = vec![[0.0f32; 4]; MAX_AGENTS];
+    let mut look = vec![[0.0f32; 4]; MAX_AGENTS];
     for (i, (x, y)) in city.scatter(n, seed.0).into_iter().enumerate() {
         state[i] = [x, y, 0.0, 0.0];
+        // 銀座（crowd::scenario::through_traffic）と同じ半径・希望速度の分布
+        let seed_i = rng.f32();
         attr[i] = [
             (rng.next_u64() % 4) as f32,
             rng.normal(1.34, 0.26).clamp(0.6, 2.0),
-            rng.f32(),
+            seed_i,
+            rng.range(0.22, 0.28),
+        ];
+        // 歩行の位相は番号でずらす（person::Gait::new と同じ）
+        aux[i] = [
+            (i as f32 * 0.618_034).fract(),
+            seed_i * std::f32::consts::TAU,
+            0.0,
             0.0,
         ];
+        let l = crate::person::look_of(i);
+        look[i] = [l.scale.x, l.scale.y, l.top as f32, l.lower as f32];
     }
     let rw =
         TextureUsages::TEXTURE_BINDING | TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_DST;
@@ -271,6 +325,29 @@ fn setup(
         TextureFormat::Rgba32Float,
         f32_bytes(&attr),
         ro,
+    ));
+    let look = images.add(float_image(
+        TEX,
+        TEX,
+        TextureFormat::Rgba32Float,
+        f32_bytes(&look),
+        ro,
+    ));
+    let aux_bytes = f32_bytes(&aux);
+    drop(aux);
+    let a0 = images.add(float_image(
+        TEX,
+        TEX,
+        TextureFormat::Rgba32Float,
+        aux_bytes.clone(),
+        rw,
+    ));
+    let a1 = images.add(float_image(
+        TEX,
+        TEX,
+        TextureFormat::Rgba32Float,
+        aux_bytes,
+        rw,
     ));
     let size = city.size as u32;
     let density = images.add(float_image(
@@ -309,7 +386,9 @@ fn setup(
     ));
     commands.insert_resource(StressImages {
         state: [s0, s1],
+        aux: [a0, a1],
         attr,
+        look,
         density,
         axis,
         blocks,
@@ -320,21 +399,27 @@ fn setup(
         nbands_y: city.y.bands.len() as u32,
     });
 
-    // 人（箱 1 つ。高さ 0〜1.7m、ローカルの +x が前）
-    let mut body = Mesh::from(Cuboid::new(0.26, 1.7, 0.44));
-    body.remove_attribute(Mesh::ATTRIBUTE_UV_0);
+    // 人: 遠さの段階ごとのメッシュ（ローカルの +x が前、足裏が原点）
+    let mut tiny = Mesh::from(Cuboid::new(0.26, 1.7, 0.44));
+    tiny.remove_attribute(Mesh::ATTRIBUTE_UV_0);
     if let Some(bevy::render::mesh::VertexAttributeValues::Float32x3(p)) =
-        body.attribute_mut(Mesh::ATTRIBUTE_POSITION)
+        tiny.attribute_mut(Mesh::ATTRIBUTE_POSITION)
     {
         p.iter_mut().for_each(|v| v[1] += 0.85);
     }
-    commands.spawn((
-        Mesh3d(meshes.add(body)),
-        StressPeople,
-        bevy::render::view::NoFrustumCulling,
-        Transform::default(),
-        Visibility::default(),
-    ));
+    for (mesh, kind) in [
+        (crate::person::build_rigged(), StressPeople::Near),
+        (crate::person::build_far(), StressPeople::Mid),
+        (tiny, StressPeople::Distant),
+    ] {
+        commands.spawn((
+            Mesh3d(meshes.add(mesh)),
+            kind,
+            bevy::render::view::NoFrustumCulling,
+            Transform::default(),
+            Visibility::default(),
+        ));
+    }
 
     // 街: 地面（街路）・公園・建物
     let half = city.size * 0.5;
@@ -407,8 +492,8 @@ fn setup(
                 to_world(mid(&city.x), mid(&city.y))
             },
             yaw: -0.6,
-            pitch: 0.95,
-            distance: 160.0,
+            pitch: 0.7,
+            distance: 70.0,
         },
         Transform::default(),
     ));
@@ -480,7 +565,8 @@ fn advance(time: Res<Time>, mut sim: ResMut<StressSim>) {
     let mut dt = 0.0;
     // 最初の数フレームはパイプラインの準備を待つ
     if !sim.paused && sim.frame > 3 {
-        dt = (real * sim.speed).min(MAX_DT);
+        let max_dt = if sim.lite { MAX_DT_LITE } else { MAX_DT_FULL };
+        dt = (real * sim.speed).min(max_dt);
         let src = sim.latest;
         sim.step = Some((src, 1 - src));
         sim.latest = 1 - src;
@@ -495,10 +581,44 @@ fn advance(time: Res<Time>, mut sim: ResMut<StressSim>) {
     if sim.log_in <= 0.0 {
         sim.log_in = 5.0;
         info!(
-            "perf: {:.1} fps, sim x{:.2}, {} agents (GPU)",
-            sim.fps, sim.sim_rate, sim.n
+            "perf: {:.1} fps, sim x{:.2}, {} agents (GPU, {} model)",
+            sim.fps,
+            sim.sim_rate,
+            sim.n,
+            if sim.lite { "lite" } else { "full" }
         );
     }
+}
+
+/// 歩く人型・箱 5 つで描く範囲を、銀座のデモと同じ「画面上の身長」の基準で決める
+fn lod_ranges(
+    mut sim: ResMut<StressSim>,
+    camera: Query<(&Transform, &Projection), With<Camera3d>>,
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+) {
+    let Ok((tf, Projection::Perspective(p))) = camera.single() else {
+        return;
+    };
+    let h = windows.single().map_or(800.0, |w| w.height());
+    // 距離 1m あたり身長 1m が何 px になるか
+    let px_per_m = h / (2.0 * (p.fov * 0.5).tan());
+    let half = sim.size * 0.5;
+    let (cx, cy) = (tf.translation.x + half, -tf.translation.z + half);
+    let height = tf.translation.y.max(0.0);
+    let range = |px: f32, cap: i32| -> i32 {
+        let d = 1.7 * px_per_m / px;
+        if d <= height {
+            return -1;
+        }
+        let r = (d * d - height * height).sqrt();
+        ((r / CELL).ceil() as i32).min(cap)
+    };
+    sim.cam_cell = (
+        ((cx / CELL).floor() as i32).clamp(0, GRID as i32 - 1),
+        ((cy / CELL).floor() as i32).clamp(0, GRID as i32 - 1),
+    );
+    sim.near_half = range(FAR_PERSON_PX, MAX_NEAR_HALF);
+    sim.mid_half = range(TINY_PERSON_PX, MAX_MID_HALF).max(sim.near_half);
 }
 
 fn keys(keys: Res<ButtonInput<KeyCode>>, mut sim: ResMut<StressSim>) {
@@ -565,13 +685,36 @@ fn panel(
                 ui.label("人数:");
                 for (n, label) in [(100_000, "10万"), (300_000, "30万"), (1_000_000, "100万")] {
                     if ui.selectable_label(sim.n == n, label).clicked() && sim.n != n {
-                        reload_with(&format!("?city=synthetic&agents={n}"));
+                        reload_with(&format!(
+                            "?city=synthetic&agents={n}{}",
+                            if sim.lite { "&model=lite" } else { "" }
+                        ));
                     }
                 }
             });
+            ui.horizontal(|ui| {
+                ui.label("歩行者モデル:");
+                let q = |lite: bool| {
+                    format!(
+                        "?city=synthetic&agents={}{}",
+                        sim.n,
+                        if lite { "&model=lite" } else { "" }
+                    )
+                };
+                if ui
+                    .selectable_label(!sim.lite, "銀座と同じ（SFM）")
+                    .clicked()
+                    && sim.lite
+                {
+                    reload_with(&q(false));
+                }
+                if ui.selectable_label(sim.lite, "密度場（軽量）").clicked() && !sim.lite {
+                    reload_with(&q(true));
+                }
+            });
             ui.small(
-                "計算と描画はすべて GPU 上。歩行者は密度場の簡易モデルで、車・信号は無し。\
-                 人は箱 1 つで表示。",
+                "計算と描画はすべて GPU 上。人の見た目は銀座と同じ（数ピクセルの遠方だけ箱 1 つ）。\
+                 車・信号は無し。",
             );
             if ui.link("← 銀座 4 丁目のデモに戻る").clicked() {
                 reload_with("?");
@@ -581,7 +724,7 @@ fn panel(
 }
 
 fn fmt_count(n: usize) -> String {
-    if n >= 10_000 && n % 10_000 == 0 {
+    if n >= 10_000 && n.is_multiple_of(10_000) {
         format!("{} 万", n / 10_000)
     } else {
         n.to_string()
@@ -613,15 +756,19 @@ struct StressShaders {
 
 impl Plugin for StressRenderPlugin {
     fn build(&self, app: &mut App) {
+        let people_src = format!(
+            "{}\n{}\n{}\n{}",
+            crate::person::lowers_wgsl(),
+            crate::person::tops_wgsl(),
+            crate::person::rig_wgsl(),
+            include_str!("stress_people.wgsl")
+        );
         let mut shaders = app.world_mut().resource_mut::<Assets<Shader>>();
         let sim = shaders.add(Shader::from_wgsl(
             include_str!("stress_sim.wgsl"),
             "stress_sim.wgsl",
         ));
-        let people = shaders.add(Shader::from_wgsl(
-            include_str!("stress_people.wgsl"),
-            "stress_people.wgsl",
-        ));
+        let people = shaders.add(Shader::from_wgsl(people_src, "stress_people.wgsl"));
         app.add_plugins((
             ExtractResourcePlugin::<StressSim>::default(),
             ExtractResourcePlugin::<StressImages>::default(),
@@ -678,25 +825,105 @@ mod uniforms {
     pub struct PeopleUniform {
         pub size: f32,
         pub n: u32,
+        pub cam_x: i32,
+        pub cam_y: i32,
+        pub near_half: i32,
+        pub mid_half: i32,
         pub _pad0: u32,
         pub _pad1: u32,
     }
 }
 
+/// 近傍表のテクスチャ（初期データが要らないので描画側で直接作る）
+struct TableTextures {
+    slots: Vec<TextureView>,
+    depth: TextureView,
+    /// 8 枚を 4 人ずつ 2 枚にまとめたもの（Rgba32Uint）。読む側はこちらを使う
+    packed: [TextureView; 2],
+}
+
 #[derive(Resource)]
 struct SimPipelines {
+    table_first_layout: BindGroupLayout,
+    table_next_layout: BindGroupLayout,
     density_layout: BindGroupLayout,
-    update_layout: BindGroupLayout,
+    update_full_layout: BindGroupLayout,
+    update_lite_layout: BindGroupLayout,
+    pack: CachedRenderPipelineId,
+    pack_group: BindGroup,
+    table_first: CachedRenderPipelineId,
+    table_next: CachedRenderPipelineId,
     density: CachedRenderPipelineId,
-    update: CachedRenderPipelineId,
+    update_full: CachedRenderPipelineId,
+    update_lite: CachedRenderPipelineId,
     sampler: Sampler,
+    table: TableTextures,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn point_pipeline(
+    label: &'static str,
+    layout: &BindGroupLayout,
+    shader: &Handle<Shader>,
+    defs: Vec<ShaderDefVal>,
+    vertex: &'static str,
+    fragment: &'static str,
+    target: ColorTargetState,
+    depth: Option<DepthStencilState>,
+) -> RenderPipelineDescriptor {
+    RenderPipelineDescriptor {
+        label: Some(label.into()),
+        layout: vec![layout.clone()],
+        push_constant_ranges: vec![],
+        vertex: VertexState {
+            shader: shader.clone(),
+            shader_defs: defs.clone(),
+            entry_point: Cow::from(vertex),
+            buffers: vec![],
+        },
+        primitive: PrimitiveState {
+            topology: PrimitiveTopology::PointList,
+            ..default()
+        },
+        depth_stencil: depth,
+        multisample: MultisampleState::default(),
+        fragment: Some(FragmentState {
+            shader: shader.clone(),
+            shader_defs: defs,
+            entry_point: Cow::from(fragment),
+            targets: vec![Some(target)],
+        }),
+        zero_initialize_workgroup_memory: false,
+    }
 }
 
 impl FromWorld for SimPipelines {
     fn from_world(world: &mut World) -> Self {
         let device = world.resource::<RenderDevice>();
         let unfilterable = TextureSampleType::Float { filterable: false };
+        let uint = TextureSampleType::Uint;
         let stage = ShaderStages::VERTEX_FRAGMENT;
+        let table_first_layout = device.create_bind_group_layout(
+            "stress table layout",
+            &BindGroupLayoutEntries::sequential(
+                stage,
+                (
+                    uniform_buffer::<SimUniform>(false),
+                    texture_2d(unfilterable),
+                ),
+            ),
+        );
+        let table_next_layout = device.create_bind_group_layout(
+            "stress table next layout",
+            &BindGroupLayoutEntries::sequential(
+                stage,
+                (
+                    uniform_buffer::<SimUniform>(false),
+                    texture_2d(unfilterable),
+                    texture_2d(uint),
+                ),
+            ),
+        );
         let density_layout = device.create_bind_group_layout(
             "stress density layout",
             &BindGroupLayoutEntries::sequential(
@@ -707,19 +934,46 @@ impl FromWorld for SimPipelines {
                 ),
             ),
         );
-        let update_layout = device.create_bind_group_layout(
-            "stress update layout",
+        let common = (
+            uniform_buffer::<SimUniform>(false),
+            texture_2d(unfilterable),
+            texture_2d(unfilterable),
+            texture_2d(unfilterable),
+            texture_2d(unfilterable),
+            texture_2d(unfilterable),
+            texture_2d(unfilterable),
+        );
+        let update_full_layout = device.create_bind_group_layout(
+            "stress update layout (full)",
+            &BindGroupLayoutEntries::sequential(
+                stage,
+                (
+                    common.0,
+                    common.1,
+                    common.2,
+                    common.3,
+                    common.4,
+                    common.5,
+                    common.6,
+                    texture_2d(uint),
+                    texture_2d(uint),
+                ),
+            ),
+        );
+        let update_lite_layout = device.create_bind_group_layout(
+            "stress update layout (lite)",
             &BindGroupLayoutEntries::sequential(
                 stage,
                 (
                     uniform_buffer::<SimUniform>(false),
                     texture_2d(unfilterable),
                     texture_2d(unfilterable),
+                    texture_2d(unfilterable),
+                    texture_2d(unfilterable),
+                    texture_2d(unfilterable),
+                    texture_2d(unfilterable),
                     texture_2d(TextureSampleType::Float { filterable: true }),
                     sampler(SamplerBindingType::Filtering),
-                    texture_2d(unfilterable),
-                    texture_2d(unfilterable),
-                    texture_2d(unfilterable),
                 ),
             ),
         );
@@ -731,50 +985,154 @@ impl FromWorld for SimPipelines {
             address_mode_v: AddressMode::ClampToEdge,
             ..default()
         });
+        let tex = |label: &'static str, format: TextureFormat| {
+            device
+                .create_texture(&TextureDescriptor {
+                    label: Some(label),
+                    size: Extent3d {
+                        width: GRID,
+                        height: GRID,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: TextureDimension::D2,
+                    format,
+                    usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&TextureViewDescriptor::default())
+        };
+        let table = TableTextures {
+            slots: (0..SLOTS)
+                .map(|_| tex("stress neighbor slot", TextureFormat::R32Uint))
+                .collect(),
+            depth: tex("stress neighbor depth", TextureFormat::Depth32Float),
+            packed: [
+                tex("stress neighbor packed", TextureFormat::Rgba32Uint),
+                tex("stress neighbor packed", TextureFormat::Rgba32Uint),
+            ],
+        };
+        let pack_layout = device.create_bind_group_layout(
+            "stress pack layout",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::FRAGMENT,
+                (
+                    texture_2d(uint),
+                    texture_2d(uint),
+                    texture_2d(uint),
+                    texture_2d(uint),
+                    texture_2d(uint),
+                    texture_2d(uint),
+                    texture_2d(uint),
+                    texture_2d(uint),
+                ),
+            ),
+        );
+        let sl = &table.slots;
+        let pack_group = device.create_bind_group(
+            "stress pack bind group",
+            &pack_layout,
+            &BindGroupEntries::sequential((
+                &sl[0], &sl[1], &sl[2], &sl[3], &sl[4], &sl[5], &sl[6], &sl[7],
+            )),
+        );
+
         let shader = world.resource::<StressShaders>().sim.clone();
         let cache = world.resource::<PipelineCache>();
-        let density = cache.queue_render_pipeline(RenderPipelineDescriptor {
-            label: Some("stress density".into()),
-            layout: vec![density_layout.clone()],
-            push_constant_ranges: vec![],
-            vertex: VertexState {
-                shader: shader.clone(),
-                shader_defs: vec![],
-                entry_point: Cow::from("density_vertex"),
-                buffers: vec![],
-            },
-            primitive: PrimitiveState {
-                topology: PrimitiveTopology::PointList,
-                ..default()
-            },
-            depth_stencil: None,
-            multisample: MultisampleState::default(),
-            fragment: Some(FragmentState {
-                shader: shader.clone(),
-                shader_defs: vec![],
-                entry_point: Cow::from("density_fragment"),
-                targets: vec![Some(ColorTargetState {
-                    format: TextureFormat::R16Float,
-                    blend: Some(BlendState {
-                        color: BlendComponent {
-                            src_factor: BlendFactor::One,
-                            dst_factor: BlendFactor::One,
-                            operation: BlendOperation::Add,
-                        },
-                        alpha: BlendComponent::OVER,
-                    }),
-                    write_mask: ColorWrites::ALL,
-                })],
-            }),
-            zero_initialize_workgroup_memory: false,
+        let table_target = ColorTargetState {
+            format: TextureFormat::R32Uint,
+            blend: None,
+            write_mask: ColorWrites::ALL,
+        };
+        let table_depth = Some(DepthStencilState {
+            format: TextureFormat::Depth32Float,
+            depth_write_enabled: true,
+            depth_compare: CompareFunction::Less,
+            stencil: StencilState::default(),
+            bias: DepthBiasState::default(),
         });
-        let update = cache.queue_render_pipeline(RenderPipelineDescriptor {
-            label: Some("stress update".into()),
-            layout: vec![update_layout.clone()],
+        let table_first = cache.queue_render_pipeline(point_pipeline(
+            "stress table",
+            &table_first_layout,
+            &shader,
+            vec![],
+            "table_vertex",
+            "table_fragment",
+            table_target.clone(),
+            table_depth.clone(),
+        ));
+        let table_next = cache.queue_render_pipeline(point_pipeline(
+            "stress table next",
+            &table_next_layout,
+            &shader,
+            vec!["TABLE_NEXT".into()],
+            "table_vertex",
+            "table_fragment",
+            table_target,
+            table_depth,
+        ));
+        let density = cache.queue_render_pipeline(point_pipeline(
+            "stress density",
+            &density_layout,
+            &shader,
+            vec![],
+            "density_vertex",
+            "density_fragment",
+            ColorTargetState {
+                format: TextureFormat::R16Float,
+                blend: Some(BlendState {
+                    color: BlendComponent {
+                        src_factor: BlendFactor::One,
+                        dst_factor: BlendFactor::One,
+                        operation: BlendOperation::Add,
+                    },
+                    alpha: BlendComponent::OVER,
+                }),
+                write_mask: ColorWrites::ALL,
+            },
+            None,
+        ));
+        let update = |label: &'static str, layout: &BindGroupLayout, defs: Vec<ShaderDefVal>| {
+            let target = Some(ColorTargetState {
+                format: TextureFormat::Rgba32Float,
+                blend: None,
+                write_mask: ColorWrites::ALL,
+            });
+            cache.queue_render_pipeline(RenderPipelineDescriptor {
+                label: Some(label.into()),
+                layout: vec![layout.clone()],
+                push_constant_ranges: vec![],
+                vertex: VertexState {
+                    shader: shader.clone(),
+                    shader_defs: defs.clone(),
+                    entry_point: Cow::from("fullscreen_vertex"),
+                    buffers: vec![],
+                },
+                primitive: PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: MultisampleState::default(),
+                fragment: Some(FragmentState {
+                    shader: shader.clone(),
+                    shader_defs: defs,
+                    entry_point: Cow::from("update_fragment"),
+                    targets: vec![target.clone(), target],
+                }),
+                zero_initialize_workgroup_memory: false,
+            })
+        };
+        let pack_target = Some(ColorTargetState {
+            format: TextureFormat::Rgba32Uint,
+            blend: None,
+            write_mask: ColorWrites::ALL,
+        });
+        let pack = cache.queue_render_pipeline(RenderPipelineDescriptor {
+            label: Some("stress pack".into()),
+            layout: vec![pack_layout.clone()],
             push_constant_ranges: vec![],
             vertex: VertexState {
                 shader: shader.clone(),
-                shader_defs: vec!["UPDATE".into()],
+                shader_defs: vec!["PACK".into()],
                 entry_point: Cow::from("fullscreen_vertex"),
                 buffers: vec![],
             },
@@ -782,32 +1140,55 @@ impl FromWorld for SimPipelines {
             depth_stencil: None,
             multisample: MultisampleState::default(),
             fragment: Some(FragmentState {
-                shader,
-                shader_defs: vec!["UPDATE".into()],
-                entry_point: Cow::from("update_fragment"),
-                targets: vec![Some(ColorTargetState {
-                    format: TextureFormat::Rgba32Float,
-                    blend: None,
-                    write_mask: ColorWrites::ALL,
-                })],
+                shader: shader.clone(),
+                shader_defs: vec!["PACK".into()],
+                entry_point: Cow::from("pack_fragment"),
+                targets: vec![pack_target.clone(), pack_target],
             }),
             zero_initialize_workgroup_memory: false,
         });
+        let update_full = update(
+            "stress update (full)",
+            &update_full_layout,
+            vec!["UPDATE".into()],
+        );
+        let update_lite = update(
+            "stress update (lite)",
+            &update_lite_layout,
+            vec!["UPDATE".into(), "LITE".into()],
+        );
         Self {
+            table_first_layout,
+            table_next_layout,
             density_layout,
-            update_layout,
+            update_full_layout,
+            update_lite_layout,
+            pack,
+            pack_group,
+            table_first,
+            table_next,
             density,
-            update,
+            update_full,
+            update_lite,
             sampler,
+            table,
         }
     }
+}
+
+/// 1 ステップぶんのバインドグループと書き込み先
+struct StepGroups {
+    table: Vec<BindGroup>,
+    density: Option<(BindGroup, TextureView)>,
+    update: BindGroup,
+    state_dst: TextureView,
+    aux_dst: TextureView,
 }
 
 /// このフレームで使うバインドグループ
 #[derive(Resource)]
 struct StressBindGroups {
-    /// ステップを進めるなら (密度パス, 更新パス, 書き込み先の状態テクスチャ, 密度テクスチャ)
-    step: Option<(BindGroup, BindGroup, TextureView, TextureView)>,
+    step: Option<StepGroups>,
     people: BindGroup,
     // バッファはバインドグループが使い終わるまで保持する
     _buffers: Vec<UniformBuffer<SimUniform>>,
@@ -828,19 +1209,36 @@ fn prepare_bind_groups(
     let (Some(sim), Some(img)) = (sim, images) else {
         return;
     };
-    let get = |h: &Handle<Image>| gpu_images.get(h);
-    let (Some(s0), Some(s1), Some(attr), Some(dens), Some(axis), Some(blocks), Some(bands)) = (
+    let get = |h: &Handle<Image>| gpu_images.get(h).map(|g| &g.texture_view);
+    let (
+        Some(s0),
+        Some(s1),
+        Some(a0),
+        Some(a1),
+        Some(attr),
+        Some(look),
+        Some(dens),
+        Some(axis),
+        Some(blocks),
+        Some(bands),
+    ) = (
         get(&img.state[0]),
         get(&img.state[1]),
+        get(&img.aux[0]),
+        get(&img.aux[1]),
         get(&img.attr),
+        get(&img.look),
         get(&img.density),
         get(&img.axis),
         get(&img.blocks),
         get(&img.bands),
-    ) else {
+    )
+    else {
         return;
     };
     let states = [s0, s1];
+    let auxes = [a0, a1];
+    let slots = &pipelines.table.slots;
     let mut buffers = vec![];
     let step = sim.step.map(|(src, dst)| {
         let mut u = UniformBuffer::from(SimUniform {
@@ -854,36 +1252,75 @@ fn prepare_bind_groups(
             nbands_y: img.nbands_y,
         });
         u.write_buffer(&device, &queue);
-        let density_bg = device.create_bind_group(
-            "stress density bind group",
-            &pipelines.density_layout,
-            &BindGroupEntries::sequential((u.binding().unwrap(), &states[src].texture_view)),
-        );
-        let update_bg = device.create_bind_group(
-            "stress update bind group",
-            &pipelines.update_layout,
-            &BindGroupEntries::sequential((
-                u.binding().unwrap(),
-                &states[src].texture_view,
-                &attr.texture_view,
-                &dens.texture_view,
-                &pipelines.sampler,
-                &axis.texture_view,
-                &blocks.texture_view,
-                &bands.texture_view,
-            )),
-        );
+        let ub = u.binding().unwrap();
+        let mut table = vec![device.create_bind_group(
+            "stress table bind group",
+            &pipelines.table_first_layout,
+            &BindGroupEntries::sequential((ub.clone(), states[src])),
+        )];
+        for k in 1..SLOTS {
+            table.push(device.create_bind_group(
+                "stress table bind group",
+                &pipelines.table_next_layout,
+                &BindGroupEntries::sequential((ub.clone(), states[src], &slots[k - 1])),
+            ));
+        }
+        let (density, update) = if sim.lite {
+            let d = device.create_bind_group(
+                "stress density bind group",
+                &pipelines.density_layout,
+                &BindGroupEntries::sequential((ub.clone(), states[src])),
+            );
+            let up = device.create_bind_group(
+                "stress update bind group (lite)",
+                &pipelines.update_lite_layout,
+                &BindGroupEntries::sequential((
+                    ub.clone(),
+                    states[src],
+                    attr,
+                    auxes[src],
+                    axis,
+                    blocks,
+                    bands,
+                    dens,
+                    &pipelines.sampler,
+                )),
+            );
+            (Some((d, dens.clone())), up)
+        } else {
+            let up = device.create_bind_group(
+                "stress update bind group (full)",
+                &pipelines.update_full_layout,
+                &BindGroupEntries::sequential((
+                    ub.clone(),
+                    states[src],
+                    attr,
+                    auxes[src],
+                    axis,
+                    blocks,
+                    bands,
+                    &pipelines.table.packed[0],
+                    &pipelines.table.packed[1],
+                )),
+            );
+            (None, up)
+        };
         buffers.push(u);
-        (
-            density_bg,
-            update_bg,
-            states[dst].texture_view.clone(),
-            dens.texture_view.clone(),
-        )
+        StepGroups {
+            table,
+            density,
+            update,
+            state_dst: states[dst].clone(),
+            aux_dst: auxes[dst].clone(),
+        }
     });
     let mut pu = UniformBuffer::from(PeopleUniform {
         size: sim.size,
         n: sim.n as u32,
+        cam_x: sim.cam_cell.0,
+        cam_y: sim.cam_cell.1,
+        near_half: sim.near_half,
+        mid_half: sim.mid_half,
         ..default()
     });
     pu.write_buffer(&device, &queue);
@@ -892,8 +1329,11 @@ fn prepare_bind_groups(
         &people_pipeline.layout,
         &BindGroupEntries::sequential((
             pu.binding().unwrap(),
-            &states[sim.latest].texture_view,
-            &attr.texture_view,
+            states[sim.latest],
+            look,
+            auxes[sim.latest],
+            &pipelines.table.packed[0],
+            &pipelines.table.packed[1],
         )),
     );
     commands.insert_resource(StressBindGroups {
@@ -920,22 +1360,90 @@ impl render_graph::Node for StressSimNode {
         ) else {
             return Ok(());
         };
-        let Some((density_bg, update_bg, dst, dens)) = &groups.step else {
+        let Some(step) = &groups.step else {
             return Ok(());
         };
         let pipelines = world.resource::<SimPipelines>();
         let cache = world.resource::<PipelineCache>();
-        let (Some(density), Some(update)) = (
-            cache.get_render_pipeline(pipelines.density),
-            cache.get_render_pipeline(pipelines.update),
+        let update_id = if sim.lite {
+            pipelines.update_lite
+        } else {
+            pipelines.update_full
+        };
+        let (Some(table_first), Some(table_next), Some(update)) = (
+            cache.get_render_pipeline(pipelines.table_first),
+            cache.get_render_pipeline(pipelines.table_next),
+            cache.get_render_pipeline(update_id),
         ) else {
             return Ok(());
         };
+        let density = cache.get_render_pipeline(pipelines.density);
+        if sim.lite && density.is_none() {
+            return Ok(());
+        }
+        let n = sim.n as u32;
+        // 1. 近傍表（8 枚）
+        for (k, bg) in step.table.iter().enumerate() {
+            let mut pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
+                label: Some("stress neighbor table"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &pipelines.table.slots[k],
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(Default::default()),
+                        store: StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                    view: &pipelines.table.depth,
+                    depth_ops: Some(Operations {
+                        load: LoadOp::Clear(1.0),
+                        store: StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_render_pipeline(if k == 0 { table_first } else { table_next });
+            pass.set_bind_group(0, bg, &[]);
+            pass.draw(0..n, 0..1);
+        }
+        // 近傍表を 2 枚にまとめる
+        let Some(pack) = cache.get_render_pipeline(pipelines.pack) else {
+            return Ok(());
+        };
         {
+            let attach = |view| {
+                Some(RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(Default::default()),
+                        store: StoreOp::Store,
+                    },
+                })
+            };
+            let mut pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
+                label: Some("stress neighbor pack"),
+                color_attachments: &[
+                    attach(&pipelines.table.packed[0]),
+                    attach(&pipelines.table.packed[1]),
+                ],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_render_pipeline(pack);
+            pass.set_bind_group(0, &pipelines.pack_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        // 2. 密度（軽量モデル）
+        if let (Some((bg, view)), Some(density)) = (&step.density, density) {
             let mut pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
                 label: Some("stress density"),
                 color_attachments: &[Some(RenderPassColorAttachment {
-                    view: dens,
+                    view,
                     resolve_target: None,
                     ops: Operations {
                         load: LoadOp::Clear(Default::default()),
@@ -947,28 +1455,30 @@ impl render_graph::Node for StressSimNode {
                 occlusion_query_set: None,
             });
             pass.set_render_pipeline(density);
-            pass.set_bind_group(0, density_bg, &[]);
-            pass.draw(0..sim.n as u32, 0..1);
+            pass.set_bind_group(0, bg, &[]);
+            pass.draw(0..n, 0..1);
         }
-        {
-            let mut pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
-                label: Some("stress update"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view: dst,
-                    resolve_target: None,
-                    ops: Operations {
-                        load: LoadOp::Load,
-                        store: StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            pass.set_render_pipeline(update);
-            pass.set_bind_group(0, update_bg, &[]);
-            pass.draw(0..3, 0..1);
-        }
+        // 3. 更新（状態と補助の 2 枚に書く）
+        let attach = |view| {
+            Some(RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: Operations {
+                    load: LoadOp::Load,
+                    store: StoreOp::Store,
+                },
+            })
+        };
+        let mut pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
+            label: Some("stress update"),
+            color_attachments: &[attach(&step.state_dst), attach(&step.aux_dst)],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_render_pipeline(update);
+        pass.set_bind_group(0, &step.update, &[]);
+        pass.draw(0..3, 0..1);
         Ok(())
     }
 }
@@ -986,6 +1496,7 @@ impl FromWorld for PeoplePipeline {
     fn from_world(world: &mut World) -> Self {
         let device = world.resource::<RenderDevice>();
         let unfilterable = TextureSampleType::Float { filterable: false };
+        let uint = TextureSampleType::Uint;
         let layout = device.create_bind_group_layout(
             "stress people layout",
             &BindGroupLayoutEntries::sequential(
@@ -994,6 +1505,9 @@ impl FromWorld for PeoplePipeline {
                     uniform_buffer::<PeopleUniform>(false),
                     texture_2d(unfilterable),
                     texture_2d(unfilterable),
+                    texture_2d(unfilterable),
+                    texture_2d(uint),
+                    texture_2d(uint),
                 ),
             ),
         );
@@ -1006,15 +1520,21 @@ impl FromWorld for PeoplePipeline {
 }
 
 impl SpecializedMeshPipeline for PeoplePipeline {
-    type Key = MeshPipelineKey;
+    type Key = (MeshPipelineKey, StressPeople);
 
     fn specialize(
         &self,
-        key: Self::Key,
+        (key, kind): Self::Key,
         layout: &MeshVertexBufferLayoutRef,
     ) -> Result<RenderPipelineDescriptor, SpecializedMeshPipelineError> {
         let mut desc = self.mesh_pipeline.specialize(key, layout)?;
+        let def: ShaderDefVal = match kind {
+            StressPeople::Near => "NEAR".into(),
+            StressPeople::Mid => "MID".into(),
+            StressPeople::Distant => "DISTANT".into(),
+        };
         desc.vertex.shader = self.shader.clone();
+        desc.vertex.shader_defs.push(def.clone());
         desc.layout.truncate(2);
         desc.layout.push(self.layout.clone());
         let frag = desc
@@ -1022,6 +1542,7 @@ impl SpecializedMeshPipeline for PeoplePipeline {
             .as_mut()
             .expect("mesh pipeline has a fragment stage");
         frag.shader = self.shader.clone();
+        frag.shader_defs.push(def);
         for t in frag.targets.iter_mut().flatten() {
             t.blend = None;
         }
@@ -1041,7 +1562,7 @@ fn queue_people(
     meshes: Res<RenderAssets<RenderMesh>>,
     render_mesh_instances: Res<RenderMeshInstances>,
     view_key_cache: Res<ViewKeyCache>,
-    groups: Query<(Entity, &bevy::render::sync_world::MainEntity), With<StressPeople>>,
+    groups: Query<(Entity, &bevy::render::sync_world::MainEntity, &StressPeople)>,
     mut phases: ResMut<ViewSortedRenderPhases<Transparent3d>>,
     views: Query<&ExtractedView>,
 ) {
@@ -1053,7 +1574,7 @@ fn queue_people(
         let Some(view_key) = view_key_cache.get(&view.retained_view_entity) else {
             continue;
         };
-        for (entity, main_entity) in &groups {
+        for (entity, main_entity, kind) in &groups {
             let Some(mesh_instance) = render_mesh_instances.render_mesh_queue_data(*main_entity)
             else {
                 continue;
@@ -1063,7 +1584,8 @@ fn queue_people(
             };
             let key =
                 *view_key | MeshPipelineKey::from_primitive_topology(mesh.primitive_topology());
-            let Ok(pipeline) = pipelines.specialize(&pipeline_cache, &pipeline, key, &mesh.layout)
+            let Ok(pipeline) =
+                pipelines.specialize(&pipeline_cache, &pipeline, (key, *kind), &mesh.layout)
             else {
                 continue;
             };
@@ -1099,13 +1621,13 @@ impl<P: PhaseItem> RenderCommand<P> for DrawPeopleFromTexture {
         Option<SRes<StressSim>>,
     );
     type ViewQuery = ();
-    type ItemQuery = ();
+    type ItemQuery = Read<StressPeople>;
 
     #[inline]
     fn render<'w>(
         item: &P,
         _view: (),
-        _entity: Option<()>,
+        kind: Option<&'w StressPeople>,
         (meshes, render_mesh_instances, mesh_allocator, groups, sim): SystemParamItem<
             'w,
             '_,
@@ -1113,9 +1635,26 @@ impl<P: PhaseItem> RenderCommand<P> for DrawPeopleFromTexture {
         >,
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
-        let (Some(groups), Some(sim)) = (groups, sim) else {
+        let (Some(groups), Some(sim), Some(kind)) = (groups, sim, kind) else {
             return RenderCommandResult::Skip;
         };
+        // 近傍表から引く段階は、カメラの周りの正方形のマス × 8 人ぶん
+        let square = |half: i32| {
+            if half < 0 {
+                0
+            } else {
+                let side = (2 * half + 1) as u32;
+                side * side * SLOTS as u32
+            }
+        };
+        let count = match kind {
+            StressPeople::Near => square(sim.near_half),
+            StressPeople::Mid => square(sim.mid_half),
+            StressPeople::Distant => sim.n as u32,
+        };
+        if count == 0 {
+            return RenderCommandResult::Skip;
+        }
         let mesh_allocator = mesh_allocator.into_inner();
         let Some(mesh_instance) = render_mesh_instances.render_mesh_queue_data(item.main_entity())
         else {
@@ -1130,7 +1669,7 @@ impl<P: PhaseItem> RenderCommand<P> for DrawPeopleFromTexture {
         };
         pass.set_bind_group(2, &groups.into_inner().people, &[]);
         pass.set_vertex_buffer(0, vertex_slice.buffer.slice(..));
-        let instances = 0..sim.n as u32;
+        let instances = 0..count;
         match &gpu_mesh.buffer_info {
             RenderMeshBufferInfo::Indexed {
                 index_format,

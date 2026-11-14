@@ -262,6 +262,8 @@ struct Builder {
     nrm: Vec<[f32; 3]>,
     col: Vec<[f32; 4]>,
     idx: Vec<u32>,
+    /// これから足す頂点の手足の番号（頂点カラーの g。`limb` を参照）
+    limb: f32,
 }
 
 fn lin(c: (f32, f32, f32)) -> [f32; 4] {
@@ -325,7 +327,7 @@ impl Builder {
             for p in f {
                 self.pos.push(p.to_array());
                 self.nrm.push(n.to_array());
-                self.col.push([pt, 0.0, 0.0, 1.0]);
+                self.col.push([pt, self.limb, 0.0, 1.0]);
             }
             self.idx
                 .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -354,7 +356,7 @@ impl Builder {
                 };
                 self.pos.push(p.to_array());
                 self.nrm.push(n.to_array());
-                self.col.push([pt, 0.0, 0.0, 1.0]);
+                self.col.push([pt, self.limb, 0.0, 1.0]);
             }
         }
         for i in 0..LAT {
@@ -381,7 +383,52 @@ impl Builder {
 /// 足裏を原点、+x を前、+y を上にした身長 1.7 m ほどの人型。`phase` 番目の歩行姿勢。
 pub fn build(phase: u8) -> Mesh {
     let s = (std::f32::consts::TAU * phase as f32 / PHASES as f32).sin();
-    let leg = s * LEG_SWING;
+    build_pose(s * LEG_SWING, false)
+}
+
+/// 手足の番号（頂点カラーの g）。`build_rigged` の人型をシェーダーで歩かせるのに使う
+pub mod limb {
+    pub const NONE: f32 = 0.0;
+    /// +z 側の脚・-z 側の脚・+z 側の腕・-z 側の腕
+    pub const LEG_POS: f32 = 1.0;
+    pub const LEG_NEG: f32 = 2.0;
+    pub const ARM_POS: f32 = 3.0;
+    pub const ARM_NEG: f32 = 4.0;
+}
+
+/// `build` と同じ人型を脚をそろえた姿勢で作り、頂点に手足の番号を付けたもの。
+/// GPU 上で動かす大人数（stress.rs）は、1 人ずつの歩行の位相に応じて
+/// シェーダーで手足を `build` と同じ角度に回す（姿勢ごとにメッシュを分けると描画が 8 回になるため）。
+pub fn build_rigged() -> Mesh {
+    build_pose(0.0, true)
+}
+
+/// シェーダー用の定数（`build` の脚の振り・関節の位置）
+pub fn rig_wgsl() -> String {
+    format!(
+        "const LEG_SWING: f32 = {LEG_SWING:.5};\nconst HIP: f32 = {HIP:.5};\n\
+         const SHOULDER_Y: f32 = 1.37;\nconst HIP_Z: f32 = 0.09;\nconst SHOULDER_Z: f32 = 0.235;\n"
+    )
+}
+
+/// シェーダーに埋め込む上着の色の表（リニア RGB, WGSL）
+pub fn tops_wgsl() -> String {
+    let items: Vec<String> = TOPS
+        .iter()
+        .map(|&c| {
+            let l = lin(c);
+            format!("vec3<f32>({:.5}, {:.5}, {:.5})", l[0], l[1], l[2])
+        })
+        .collect();
+    format!(
+        "const TOPS: array<vec3<f32>, {}> = array<vec3<f32>, {}>({});\n",
+        TOPS.len(),
+        TOPS.len(),
+        items.join(", ")
+    )
+}
+
+fn build_pose(leg: f32, rig: bool) -> Mesh {
     // 脚を開くと腰が下がる（上下の揺れ）
     let drop = HIP * (1.0 - leg.cos());
     let root = Affine3A::from_translation(Vec3::new(0.0, -drop, 0.0));
@@ -390,6 +437,13 @@ pub fn build(phase: u8) -> Mesh {
     let mut b = Builder::default();
     // 脚（左右逆に振る）と靴
     for (side, angle) in [(1.0f32, leg), (-1.0, -leg)] {
+        if rig {
+            b.limb = if side > 0.0 {
+                limb::LEG_POS
+            } else {
+                limb::LEG_NEG
+            };
+        }
         let hip = at(0.0, HIP, side * 0.09) * Affine3A::from_rotation_z(angle);
         let thigh = HIP - 0.08;
         b.cuboid(
@@ -407,6 +461,7 @@ pub fn build(phase: u8) -> Mesh {
             part::SHOES,
         );
     }
+    b.limb = limb::NONE;
     // 腰
     b.cuboid(
         at(0.0, HIP + 0.02, 0.0),
@@ -425,6 +480,13 @@ pub fn build(phase: u8) -> Mesh {
     );
     // 腕（脚と逆に振る）と手
     for (side, angle) in [(1.0f32, -leg * 0.7), (-1.0, leg * 0.7)] {
+        if rig {
+            b.limb = if side > 0.0 {
+                limb::ARM_POS
+            } else {
+                limb::ARM_NEG
+            };
+        }
         let sh = at(0.0, 1.37, side * 0.235) * Affine3A::from_rotation_z(angle);
         b.cuboid(
             sh * Affine3A::from_translation(Vec3::new(0.0, -0.25, 0.0)),
@@ -441,6 +503,7 @@ pub fn build(phase: u8) -> Mesh {
             part::SKIN,
         );
     }
+    b.limb = limb::NONE;
     // 首と頭
     b.cuboid(
         at(0.0, 1.45, 0.0),
