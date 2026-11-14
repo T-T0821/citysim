@@ -306,6 +306,14 @@ pub struct SimState {
 }
 
 impl SimState {
+    /// 1 ステップの時間 [s]。軽量モデルは硬い接触力が無いので刻みを倍にして計算量を半分にする
+    pub fn dt(&self) -> f32 {
+        match self.sim.model {
+            crowd::Model::Full => DT,
+            crowd::Model::Lite => 2.0 * DT,
+        }
+    }
+
     /// 避難所に向かう目的地の範囲（避難中のみ）
     pub fn evac_goals(&self) -> Option<std::ops::Range<usize>> {
         self.evac
@@ -335,6 +343,8 @@ fn build_sim(
     };
     let (mut sim, names) = crowd::scenario::through_traffic(grid, st.agents, st.seed)
         .context("範囲の縁に歩行可能領域がありません")?;
+    // 大人数では密度場による軽量モデルにする（1 人ずつの反発は数万人が限度）
+    sim.model = crowd::Model::auto(sim.agents.len());
     let k = st.walk_speed / 1.34;
     for a in sim.agents.iter_mut() {
         a.desired_speed = (a.desired_speed * k).clamp(0.3, 3.0);
@@ -425,6 +435,57 @@ const RECORD_WARMUP: u32 = 15;
 
 #[derive(Component)]
 struct Hud;
+
+/// スコープを抜けるときに一度だけ呼ぶ
+struct Defer<F: FnOnce()>(Option<F>);
+impl<F: FnOnce()> Drop for Defer<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
+}
+
+/// 描画の fps と、実時間 1 秒あたりに進んだシミュレーション時間（指数移動平均）
+#[derive(Resource, Default)]
+pub struct Perf {
+    pub fps: f32,
+    pub sim_rate: f32,
+    /// 1 フレームでシミュレーションの計算に使った時間 [ms]
+    pub sim_ms: f32,
+    /// 1 ステップの計算時間 [ms]
+    pub step_ms: f32,
+    /// 歩行者の表示データ作り（sync_agents）にかかった時間 [ms]
+    pub sync_ms: f32,
+    last_sim: f32,
+    log_in: f32,
+}
+
+impl Perf {
+    fn update(&mut self, dt: f32, sim_time: f32) {
+        if dt <= 0.0 {
+            return;
+        }
+        let ds = (sim_time - self.last_sim).max(0.0);
+        self.last_sim = sim_time;
+        let k = (dt / 0.5).min(1.0);
+        self.fps += (1.0 / dt - self.fps) * k;
+        self.sim_rate += (ds / dt - self.sim_rate) * k;
+        // 計測用に数秒ごとにログへ出す（Web 版はブラウザのコンソール）
+        self.log_in -= dt;
+        if self.log_in <= 0.0 {
+            self.log_in = 5.0;
+            info!(
+                "perf: {:.1} fps, sim x{:.2}, sim {:.1} ms/frame ({:.1} ms/step), sync {:.1} ms/frame",
+                self.fps, self.sim_rate, self.sim_ms, self.step_ms, self.sync_ms
+            );
+        }
+    }
+
+    fn record(v: &mut f32, ms: f32) {
+        *v += (ms - *v) * 0.1;
+    }
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> Result<()> {
@@ -562,6 +623,7 @@ fn run() -> Result<()> {
     .insert_resource(UiFont(args.ui_font.clone()))
     .init_resource::<camera::UiCapture>()
     .init_resource::<ui::Layout>()
+    .init_resource::<Perf>()
     .add_plugins(bevy_egui::EguiPlugin {
         enable_multipass_for_primary_context: false,
     })
@@ -1109,6 +1171,7 @@ fn controls(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn step_sim(
     time: Res<Time>,
     mut state: ResMut<SimState>,
@@ -1117,14 +1180,27 @@ fn step_sim(
     shot: Option<Res<ScreenshotPlan>>,
     rec: Option<Res<RecordPlan>>,
     frames: Res<bevy::diagnostic::FrameCount>,
+    mut perf: ResMut<Perf>,
 ) {
     let st = &mut *state;
     if st.paused {
         return;
     }
+    let t0 = bevy::platform::time::Instant::now();
+    let steps = std::cell::Cell::new(0u32);
+    let _timer = Defer(Some(|| {
+        let ms = t0.elapsed().as_secs_f32() * 1000.0;
+        Perf::record(&mut perf.sim_ms, ms);
+        if steps.get() > 0 {
+            Perf::record(&mut perf.step_ms, ms / steps.get() as f32);
+        }
+    }));
     let scen = &mut *scen;
     let k = settings.walk_speed / 1.34;
-    let mut advance = |st: &mut SimState| advance(st, scen, k);
+    let mut advance = |st: &mut SimState| {
+        steps.set(steps.get() + 1);
+        advance(st, scen, k)
+    };
     if let Some(r) = rec {
         // 録画モード: 描画速度に関係なく 1 フレーム = sim_per_frame 秒
         if frames.0 < RECORD_WARMUP || r.idx >= r.frames {
@@ -1134,22 +1210,24 @@ fn step_sim(
             return;
         }
         st.acc += r.sim_per_frame;
-        let n = (st.acc / DT + 1e-4) as usize;
-        st.acc -= n as f32 * DT;
+        let dt = st.dt();
+        let n = (st.acc / dt + 1e-4) as usize;
+        st.acc -= n as f32 * dt;
         for _ in 0..n {
             advance(st);
         }
         return;
     }
     let realtime = shot.is_none();
+    let dt = st.dt();
     // スクリーンショットモードでは描画速度に関係なく決まった時刻まで一気に進める
     let mut budget = match shot {
-        Some(s) if st.sim.time < s.at => ((s.at - st.sim.time) / DT).ceil() as usize,
+        Some(s) if st.sim.time < s.at => ((s.at - st.sim.time) / dt).ceil() as usize,
         Some(_) => 0,
         None => {
             st.acc += time.delta_secs().min(0.1) * st.speed;
-            let n = (st.acc / DT) as usize;
-            st.acc -= n as f32 * DT;
+            let n = (st.acc / dt) as usize;
+            st.acc -= n as f32 * dt;
             n.min(40)
         }
     };
@@ -1167,6 +1245,7 @@ fn step_sim(
 }
 
 fn advance(st: &mut SimState, scen: &mut scenario::ScenarioState, speed_scale: f32) {
+    let dt = st.dt();
     {
         if let Some(t) = st.traffic.as_mut() {
             let peds: Vec<Vec2> = st
@@ -1176,7 +1255,7 @@ fn advance(st: &mut SimState, scen: &mut scenario::ScenarioState, speed_scale: f
                 .filter(|a| !a.arrived)
                 .map(|a| a.pos)
                 .collect();
-            t.step(DT, &peds);
+            t.step(dt, &peds);
             st.sim.obstacles = t.obstacles();
             // 避難中（車が止まっている間）は信号に関係なく渡る
             if let (Some(s), false) = (&t.signals, t.halted) {
@@ -1185,16 +1264,16 @@ fn advance(st: &mut SimState, scen: &mut scenario::ScenarioState, speed_scale: f
         }
         // 避難中はシナリオの発生・通行止めの切り替えを止める（経路を引き直さない）
         if st.evac.is_none() {
-            scen.before_step(&mut st.sim, DT, speed_scale);
+            scen.before_step(&mut st.sim, dt, speed_scale);
         }
-        st.sim.step(DT);
+        st.sim.step(dt);
         evac::advance(st);
         scen.stats.record(
             &st.sim,
             st.traffic
                 .iter()
                 .flat_map(|t| t.vehicles.iter().map(|v| (v.pos, v.active))),
-            DT,
+            dt,
         );
         for a in st.sim.agents.iter() {
             if !a.arrived {
@@ -1244,6 +1323,7 @@ fn respawn_arrived(st: &mut SimState, limit: usize) {
 /// 歩行者の表示を更新する: 歩き方を進め、姿勢ごと（遠くの人は簡易表示）のインスタンスの配列に振り分ける。
 /// シナリオの発生源で増えた人もここで加わる。
 fn sync_agents(
+    mut perf: ResMut<Perf>,
     state: Res<SimState>,
     settings: Res<Settings>,
     mut people: ResMut<People>,
@@ -1251,6 +1331,10 @@ fn sync_agents(
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
     mut groups: Query<&mut crowd_render::PersonInstances>,
 ) {
+    let t0 = bevy::platform::time::Instant::now();
+    let _timer = Defer(Some(move || {
+        Perf::record(&mut perf.sync_ms, t0.elapsed().as_secs_f32() * 1000.0)
+    }));
     let people = &mut *people;
     let agents = &state.sim.agents;
     if people.gaits.len() > agents.len() {
@@ -1388,8 +1472,11 @@ fn update_heat(
 fn update_hud(
     state: Res<SimState>,
     layout: Res<ui::Layout>,
+    time: Res<Time>,
+    mut perf: ResMut<Perf>,
     mut q: Query<(&mut Text, &mut Visibility), With<Hud>>,
 ) {
+    perf.update(time.delta_secs(), state.sim.time);
     let active = state.sim.active();
     for (mut t, mut vis) in &mut q {
         // 狭い画面では上のバーに時刻と人数を出すので隠す
@@ -1399,7 +1486,7 @@ fn update_hud(
             Visibility::Inherited
         });
         **t = format!(
-            "t = {:6.1} s   walking {}/{}   cars {}   speed x{}{}\n\
+            "t = {:6.1} s   walking {}/{}   cars {}   speed x{}{}   {:.0} fps  sim x{:.2}{}\n\
              LMB rotate / RMB pan / wheel zoom   [Space] pause  [Up/Down] speed  [H] heatmap",
             state.sim.time,
             active,
@@ -1407,6 +1494,13 @@ fn update_hud(
             state.traffic.as_ref().map_or(0, |t| t.active()),
             state.speed,
             if state.paused { "  (paused)" } else { "" },
+            perf.fps,
+            perf.sim_rate,
+            if state.sim.model == crowd::Model::Lite {
+                "  (lite model)"
+            } else {
+                ""
+            },
         );
     }
 }

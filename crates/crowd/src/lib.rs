@@ -68,7 +68,37 @@ pub struct Simulation {
     /// 歩道から踏み込んではいけない車道セル（信号のある所では、横断歩道・交差点内以外の車道）。
     /// 空なら制限なし。経路がそこを通るしかない人（近くに横断歩道が無いなど）だけは渡れる。
     pub curb: Vec<bool>,
+    /// 計算モデル（大人数では他者との反発を密度場で近似する軽量モデルにする）
+    pub model: Model,
     hash: SpatialHash,
+    density: DensityGrid,
+    obstacle_bins: ObstacleBins,
+    /// 軽量モデル用: セル中心での障害物距離と、障害物から離れる向き（初回に作る）
+    wall_cache: Vec<[f32; 3]>,
+}
+
+/// 歩行者どうしの相互作用の計算方法
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Model {
+    /// 近傍の 1 人ずつとの反発（Social Force Model）。数万人まで
+    #[default]
+    Full,
+    /// 密度場による近似: 前方の混み具合で歩く速さを落とし（Weidmann の基本図）、
+    /// 密度の勾配で空いている方へ押す。1 人あたりの計算が近傍の人数によらず一定で、10 万人〜100 万人向け。
+    /// すれ違いでの細かな避け合いは表現しない。
+    Lite,
+}
+
+impl Model {
+    /// これより多い人数では自動で軽量モデルにする
+    pub const AUTO_LITE_ABOVE: usize = 20_000;
+    pub fn auto(n_agents: usize) -> Self {
+        if n_agents > Self::AUTO_LITE_ABOVE {
+            Model::Lite
+        } else {
+            Model::Full
+        }
+    }
 }
 
 impl Simulation {
@@ -83,7 +113,11 @@ impl Simulation {
             obstacles: vec![],
             closed: vec![],
             curb: vec![],
+            model: Model::Full,
             hash,
+            density: DensityGrid::default(),
+            obstacle_bins: ObstacleBins::default(),
+            wall_cache: vec![],
         }
     }
 
@@ -148,6 +182,150 @@ impl Simulation {
     }
 
     pub fn step(&mut self, dt: f32) {
+        match self.model {
+            Model::Full => self.step_full(dt),
+            Model::Lite => self.step_lite(dt),
+        }
+    }
+
+    /// 密度場による軽量モデルで 1 ステップ進める（`Model::Lite`）
+    fn step_lite(&mut self, dt: f32) {
+        if self.wall_cache.len() != self.grid.w * self.grid.h {
+            let g = &self.grid;
+            self.wall_cache = (0..g.w * g.h)
+                .map(|i| {
+                    let (d, grad) = g.obstacle_sample(g.center(i % g.w, i / g.w));
+                    let n = grad.try_normalize().unwrap_or(Vec2::ZERO);
+                    [d, n.x, n.y]
+                })
+                .collect();
+        }
+        self.obstacle_bins.rebuild(&self.obstacles);
+        self.density.rebuild(&self.grid, &self.agents);
+        // 近くにいる人どうしを配列上でも近くに並べた写しで計算する。格子（障害物距離・
+        // フローフィールド・密度）を引く場所がそろい、10 万人規模ではキャッシュミスが大きく減る。
+        // 計算は 1 人ずつ独立なので、並べ替えても結果は同じ。
+        let order = self.density.order(&self.agents);
+        let mut work: Vec<Agent> = order
+            .iter()
+            .map(|&i| self.agents[i as usize].clone())
+            .collect();
+        let this = &*self;
+        par::for_each_mut(&mut work, |_, a| {
+            let f = this.force_lite(a);
+            this.integrate(a, f, dt);
+        });
+        for (a, &i) in work.into_iter().zip(&order) {
+            self.agents[i as usize] = a;
+        }
+        self.time += dt;
+    }
+
+    fn force_lite(&self, a: &Agent) -> Vec2 {
+        if a.arrived {
+            return Vec2::ZERO;
+        }
+        let p = &self.params;
+        let e = self.goals[a.goal]
+            .direction(&self.grid, a.pos)
+            .unwrap_or(Vec2::ZERO);
+        let speed = if self.waits(a.pos, a.pos + e * (a.radius + 0.5)) {
+            0.0
+        } else {
+            // 1 m 先の密度で歩く速さを決める（自分の寄与はほぼ入らない距離）
+            let rho = self.density.sample(a.pos + e * DensityGrid::CELL);
+            a.desired_speed * weidmann(rho)
+        };
+        let mut f = (e * speed - a.vel) / p.tau;
+        // 混んでいる方から空いている方へ押す
+        f -= self.density.gradient(a.pos) * LITE_PRESSURE;
+        f + self.wall_force_lite(a) + self.obstacle_force(a, e)
+    }
+
+    /// 壁からの反発（軽量モデル）: セルごとに前もって求めた距離と勾配を引くだけで済ませる
+    fn wall_force_lite(&self, a: &Agent) -> Vec2 {
+        let p = &self.params;
+        let Some((x, y)) = self.grid.cell_of(a.pos) else {
+            return Vec2::ZERO;
+        };
+        let [dw, gx, gy] = self.wall_cache[self.grid.idx(x, y)];
+        if dw > a.radius + WALL_SKIP || (gx == 0.0 && gy == 0.0) {
+            return Vec2::ZERO;
+        }
+        let nw = Vec2::new(gx, gy);
+        let overlap = a.radius - dw;
+        let mut f = nw * (p.a_wall * (overlap / p.b_wall).exp());
+        if overlap > 0.0 {
+            f += nw * (p.k_body * overlap);
+        }
+        f
+    }
+
+    /// 壁からの反発（Full モデル）
+    fn wall_force(&self, a: &Agent) -> Vec2 {
+        let p = &self.params;
+        // 壁から十分離れていれば力はほぼ 0（1.5m 先で 1e-3 倍以下）なので、補間と勾配の計算を省く
+        if let Some((x, y)) = self.grid.cell_of(a.pos) {
+            if self.grid.obstacle_dist[self.grid.idx(x, y)] > a.radius + WALL_SKIP {
+                return Vec2::ZERO;
+            }
+        }
+        let (dw, grad) = self.grid.obstacle_sample(a.pos);
+        let Some(nw) = grad.try_normalize() else {
+            return Vec2::ZERO;
+        };
+        let overlap = a.radius - dw;
+        let mut f = nw * (p.a_wall * (overlap / p.b_wall).exp());
+        if overlap > 0.0 {
+            f += nw * (p.k_body * overlap);
+        }
+        f
+    }
+
+    /// 車両など動く障害物からの力（両モデル共通）
+    fn obstacle_force(&self, a: &Agent, e: Vec2) -> Vec2 {
+        let p = &self.params;
+        let mut f = Vec2::ZERO;
+        for &k in self.obstacle_bins.near(a.pos) {
+            let (oa, ob, r) = self.obstacles[k as usize];
+            // 端点の外接矩形で先に弾く（ほとんどの車は遠い）
+            let reach = r + 3.0;
+            if a.pos.x < oa.x.min(ob.x) - reach
+                || a.pos.x > oa.x.max(ob.x) + reach
+                || a.pos.y < oa.y.min(ob.y) - reach
+                || a.pos.y > oa.y.max(ob.y) + reach
+            {
+                continue;
+            }
+            let ab = ob - oa;
+            let t = ((a.pos - oa).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+            let d = a.pos - (oa + ab * t);
+            let dist = d.length();
+            if dist > reach {
+                continue;
+            }
+            let Some(n) = d.try_normalize() else { continue };
+            let overlap = a.radius + r - dist;
+            let mag = p.a_wall * 2.0 * (overlap / 0.5).exp() + p.k_body * 2.0 * overlap.max(0.0);
+            // 押し付けられて壁際で動けなくならないよう上限を設ける
+            f += n * mag.min(40.0);
+            // 行く手をふさぐ車は車体に沿って回り込む（止まった車の前で押し合って動けなくならない）
+            let ahead = e.dot(-n);
+            if ahead > 0.0 && dist < r + 1.5 {
+                let axis = ab.try_normalize().unwrap_or(n.perp());
+                let side = if axis.dot(e).abs() > 0.1 {
+                    axis.dot(e).signum()
+                } else {
+                    1.0
+                };
+                f += axis * side * (ahead * a.desired_speed / p.tau);
+            }
+        }
+        f
+    }
+
+    fn step_full(&mut self, dt: f32) {
+        self.obstacle_bins.rebuild(&self.obstacles);
         let p = &self.params;
         self.hash.rebuild(&self.agents);
         let mut acc = vec![Vec2::ZERO; self.agents.len()];
@@ -189,50 +367,9 @@ impl Simulation {
             });
 
             // 壁
-            let (dw, grad) = self.grid.obstacle_sample(a.pos);
-            if let Some(nw) = grad.try_normalize() {
-                let overlap = a.radius - dw;
-                f += nw * (p.a_wall * (overlap / p.b_wall).exp());
-                if overlap > 0.0 {
-                    f += nw * (p.k_body * overlap);
-                }
-            }
+            f += self.wall_force(a);
             // 車両など動く障害物（壁より強く、少し遠くから避ける）
-            for &(oa, ob, r) in &self.obstacles {
-                // 端点の外接矩形で先に弾く（ほとんどの車は遠い）
-                let reach = r + 3.0;
-                if a.pos.x < oa.x.min(ob.x) - reach
-                    || a.pos.x > oa.x.max(ob.x) + reach
-                    || a.pos.y < oa.y.min(ob.y) - reach
-                    || a.pos.y > oa.y.max(ob.y) + reach
-                {
-                    continue;
-                }
-                let ab = ob - oa;
-                let t = ((a.pos - oa).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
-                let d = a.pos - (oa + ab * t);
-                let dist = d.length();
-                if dist > reach {
-                    continue;
-                }
-                let Some(n) = d.try_normalize() else { continue };
-                let overlap = a.radius + r - dist;
-                let mag =
-                    p.a_wall * 2.0 * (overlap / 0.5).exp() + p.k_body * 2.0 * overlap.max(0.0);
-                // 押し付けられて壁際で動けなくならないよう上限を設ける
-                f += n * mag.min(40.0);
-                // 行く手をふさぐ車は車体に沿って回り込む（止まった車の前で押し合って動けなくならない）
-                let ahead = e.dot(-n);
-                if ahead > 0.0 && dist < r + 1.5 {
-                    let axis = ab.try_normalize().unwrap_or(n.perp());
-                    let side = if axis.dot(e).abs() > 0.1 {
-                        axis.dot(e).signum()
-                    } else {
-                        1.0
-                    };
-                    f += axis * side * (ahead * a.desired_speed / p.tau);
-                }
-            }
+            f += self.obstacle_force(a, e);
             f
         };
         par::for_each_mut(&mut acc, |i, out| *out = force(i, &self.agents[i]));
@@ -435,6 +572,194 @@ impl SpatialHash {
     }
 }
 
+/// 壁からこの距離 [m]（＋自分の半径）より離れていれば壁の力を計算しない
+const WALL_SKIP: f32 = 1.5;
+
+/// 動く障害物（車）を粗い格子に振り分けたもの。各歩行者は自分の区画にかかる車だけを調べる。
+#[derive(Default)]
+struct ObstacleBins {
+    x0: f32,
+    y0: f32,
+    nx: usize,
+    ny: usize,
+    start: Vec<u32>,
+    ids: Vec<u32>,
+}
+
+impl ObstacleBins {
+    const CELL: f32 = 8.0;
+    /// 車から力を受ける範囲（半径 + 3m）より広くとる余裕
+    const REACH: f32 = 3.5;
+
+    fn rebuild(&mut self, obs: &[(Vec2, Vec2, f32)]) {
+        self.start.clear();
+        self.ids.clear();
+        if obs.is_empty() {
+            self.nx = 0;
+            self.ny = 0;
+            return;
+        }
+        let bbox = |&(a, b, r): &(Vec2, Vec2, f32)| {
+            let m = r + Self::REACH;
+            (a.min(b) - Vec2::splat(m), a.max(b) + Vec2::splat(m))
+        };
+        let (mut lo, mut hi) = (Vec2::splat(f32::MAX), Vec2::splat(f32::MIN));
+        for o in obs {
+            let (l, h) = bbox(o);
+            lo = lo.min(l);
+            hi = hi.max(h);
+        }
+        self.x0 = lo.x;
+        self.y0 = lo.y;
+        self.nx = ((hi.x - lo.x) / Self::CELL) as usize + 1;
+        self.ny = ((hi.y - lo.y) / Self::CELL) as usize + 1;
+        let cells = |l: Vec2, h: Vec2, nx: usize, ny: usize, x0: f32, y0: f32| {
+            let cx0 = ((l.x - x0) / Self::CELL) as usize;
+            let cy0 = ((l.y - y0) / Self::CELL) as usize;
+            let cx1 = (((h.x - x0) / Self::CELL) as usize).min(nx - 1);
+            let cy1 = (((h.y - y0) / Self::CELL) as usize).min(ny - 1);
+            (cy0..=cy1).flat_map(move |y| (cx0..=cx1).map(move |x| y * nx + x))
+        };
+        let n = self.nx * self.ny;
+        self.start.resize(n + 1, 0);
+        for o in obs {
+            let (l, h) = bbox(o);
+            for c in cells(l, h, self.nx, self.ny, self.x0, self.y0) {
+                self.start[c + 1] += 1;
+            }
+        }
+        for c in 0..n {
+            self.start[c + 1] += self.start[c];
+        }
+        self.ids.resize(self.start[n] as usize, 0);
+        let mut fill = self.start[..n].to_vec();
+        for (k, o) in obs.iter().enumerate() {
+            let (l, h) = bbox(o);
+            for c in cells(l, h, self.nx, self.ny, self.x0, self.y0) {
+                self.ids[fill[c] as usize] = k as u32;
+                fill[c] += 1;
+            }
+        }
+    }
+
+    /// p の区画にかかる障害物の番号（番号順）
+    fn near(&self, p: Vec2) -> &[u32] {
+        let (fx, fy) = ((p.x - self.x0) / Self::CELL, (p.y - self.y0) / Self::CELL);
+        if self.nx == 0 || fx < 0.0 || fy < 0.0 {
+            return &[];
+        }
+        let (x, y) = (fx as usize, fy as usize);
+        if x >= self.nx || y >= self.ny {
+            return &[];
+        }
+        let c = y * self.nx + x;
+        &self.ids[self.start[c] as usize..self.start[c + 1] as usize]
+    }
+}
+
+/// 軽量モデルで密度の勾配から受ける力の強さ [m^4/s^2]
+const LITE_PRESSURE: f32 = 1.2;
+
+/// Weidmann (1993) の基本図: 密度 rho [人/m^2] での歩行速度の自由歩行速度に対する比
+fn weidmann(rho: f32) -> f32 {
+    const RHO_MAX: f32 = 5.4;
+    if rho <= 0.05 {
+        return 1.0;
+    }
+    if rho >= RHO_MAX {
+        return 0.05;
+    }
+    (1.0 - (-1.913 * (1.0 / rho - 1.0 / RHO_MAX)).exp()).max(0.05)
+}
+
+/// 軽量モデル用の密度場: 1 m 格子に各人を双線形に配り、人/m^2 にする。
+#[derive(Default)]
+struct DensityGrid {
+    origin: Vec2,
+    w: usize,
+    h: usize,
+    rho: Vec<f32>,
+}
+
+impl DensityGrid {
+    const CELL: f32 = 1.0;
+
+    fn rebuild(&mut self, grid: &WalkGrid, agents: &[Agent]) {
+        self.origin = grid.origin;
+        self.w = ((grid.w as f32 * grid.cell) / Self::CELL).ceil() as usize + 1;
+        self.h = ((grid.h as f32 * grid.cell) / Self::CELL).ceil() as usize + 1;
+        self.rho.clear();
+        self.rho.resize(self.w * self.h, 0.0);
+        let k = 1.0 / (Self::CELL * Self::CELL);
+        for a in agents.iter().filter(|a| !a.arrived) {
+            let q = (a.pos - self.origin) / Self::CELL - Vec2::splat(0.5);
+            let (x0, y0) = (q.x.floor(), q.y.floor());
+            let (tx, ty) = (q.x - x0, q.y - y0);
+            let (x0, y0) = (x0 as i32, y0 as i32);
+            for (dx, dy, wgt) in [
+                (0, 0, (1.0 - tx) * (1.0 - ty)),
+                (1, 0, tx * (1.0 - ty)),
+                (0, 1, (1.0 - tx) * ty),
+                (1, 1, tx * ty),
+            ] {
+                let (x, y) = (x0 + dx, y0 + dy);
+                if x >= 0 && y >= 0 && (x as usize) < self.w && (y as usize) < self.h {
+                    self.rho[y as usize * self.w + x as usize] += wgt * k;
+                }
+            }
+        }
+    }
+
+    /// 到着していない人の番号を、8m 四方の区画ごとにまとめた順で返す（区画内は番号順）
+    fn order(&self, agents: &[Agent]) -> Vec<u32> {
+        const TILE: f32 = 8.0;
+        let tw = ((self.w as f32 * Self::CELL) / TILE) as usize + 1;
+        let th = ((self.h as f32 * Self::CELL) / TILE) as usize + 1;
+        let key = |p: Vec2| {
+            let q = ((p - self.origin) / TILE).max(Vec2::ZERO);
+            (q.y as usize).min(th - 1) * tw + (q.x as usize).min(tw - 1)
+        };
+        let mut start = vec![0u32; tw * th + 1];
+        for a in agents.iter().filter(|a| !a.arrived) {
+            start[key(a.pos) + 1] += 1;
+        }
+        for c in 0..tw * th {
+            start[c + 1] += start[c];
+        }
+        let mut out = vec![0u32; start[tw * th] as usize];
+        for (i, a) in agents.iter().enumerate().filter(|(_, a)| !a.arrived) {
+            let s = &mut start[key(a.pos)];
+            out[*s as usize] = i as u32;
+            *s += 1;
+        }
+        out
+    }
+
+    fn sample(&self, p: Vec2) -> f32 {
+        let q = (p - self.origin) / Self::CELL - Vec2::splat(0.5);
+        let (x0, y0) = (q.x.floor(), q.y.floor());
+        let (tx, ty) = (q.x - x0, q.y - y0);
+        let get = |x: f32, y: f32| {
+            if x < 0.0 || y < 0.0 || x as usize >= self.w || y as usize >= self.h {
+                0.0
+            } else {
+                self.rho[y as usize * self.w + x as usize]
+            }
+        };
+        let a = get(x0, y0) * (1.0 - tx) + get(x0 + 1.0, y0) * tx;
+        let b = get(x0, y0 + 1.0) * (1.0 - tx) + get(x0 + 1.0, y0 + 1.0) * tx;
+        a * (1.0 - ty) + b * ty
+    }
+
+    fn gradient(&self, p: Vec2) -> Vec2 {
+        let e = Self::CELL * 0.5;
+        Vec2::new(
+            self.sample(p + Vec2::new(e, 0.0)) - self.sample(p - Vec2::new(e, 0.0)),
+            self.sample(p + Vec2::new(0.0, e)) - self.sample(p - Vec2::new(0.0, e)),
+        ) / (2.0 * e)
+    }
+}
+
 /// 依存なしの小さな乱数 (xorshift64*)。再現性のためシード指定。
 pub struct Rng(u64);
 impl Rng {
@@ -496,6 +821,42 @@ mod tests {
         }
         assert_eq!(sim.active(), 0, "全員が 300 秒以内に到着すること");
         assert!(sim.agents.iter().all(|a| sim.grid.is_walkable(a.pos)));
+    }
+
+    #[test]
+    fn lite_model_crosses_the_sample_town_and_slows_in_crowds() {
+        let m = plateau_gml::parse_str(include_str!("../../../testdata/sample.gml")).unwrap();
+        let g = WalkGrid::from_city(&m, 0.5).unwrap();
+        let goal: Vec<_> = g.walkable_cells().filter(|&(x, _)| x + 3 >= g.w).collect();
+        let ff = FlowField::compute(&g, &goal);
+        let mut sim = Simulation::new(g, vec![ff], Params::default());
+        sim.model = Model::Lite;
+        let mut rng = Rng::new(7);
+        while sim.agents.len() < 300 {
+            let p = Vec2::new(rng.range(1.0, 10.0), rng.range(61.0, 79.0));
+            if sim.grid.obstacle_sample(p).0 > 0.4 {
+                sim.agents.push(Agent {
+                    pos: p,
+                    vel: Vec2::ZERO,
+                    radius: 0.25,
+                    desired_speed: 1.34,
+                    goal: 0,
+                    arrived: false,
+                });
+            }
+        }
+        for _ in 0..(400.0 / 0.1) as usize {
+            sim.step(0.1);
+            assert!(sim.agents.iter().all(|a| sim.grid.is_walkable(a.pos)));
+            if sim.active() == 0 {
+                break;
+            }
+        }
+        assert_eq!(sim.active(), 0, "全員が 400 秒以内に到着すること");
+        assert_eq!(weidmann(0.0), 1.0);
+        assert!(weidmann(2.0) < 0.7 && weidmann(4.0) < weidmann(2.0));
+        assert_eq!(Model::auto(1000), Model::Full);
+        assert_eq!(Model::auto(100_000), Model::Lite);
     }
 
     #[test]
