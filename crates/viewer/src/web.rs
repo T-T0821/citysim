@@ -46,7 +46,8 @@ pub fn scenario_text(path: &std::path::Path) -> Result<&'static str, String> {
 }
 
 /// URL のクエリで受け付ける設定（値なしは `no-respawn` だけ）
-const KEYS: [&str; 12] = [
+const KEYS: [&str; 13] = [
+    "city",
     "agents",
     "vehicles",
     "seed",

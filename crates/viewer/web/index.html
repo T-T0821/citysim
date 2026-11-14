@@ -51,6 +51,13 @@
   <script type="module">
     import init from "./plateau-crowd-viewer.js";
     const status = document.getElementById("status");
+    // 負荷テスト（合成の街）では読み込み中の案内と出典の表示を替える
+    if (new URLSearchParams(location.search).get("city") === "synthetic") {
+      status.querySelector("div:nth-child(2)").textContent = "合成の街（負荷テスト）を準備しています…";
+      status.querySelector("small").textContent = "乱数で作った 2km 四方の街で、最大 100 万人を GPU 上で動かします。WebGL2 に対応したブラウザで開いてください。";
+      document.getElementById("about").innerHTML =
+        '合成の街（負荷テスト用に乱数で生成）· <a href="https://github.com/T-T0821/citysim" target="_blank" rel="noopener">ソースコード</a>';
+    }
     const hide = () => { if (!status.classList.contains("error")) status.style.display = "none"; };
     try {
       // init() の中で Rust の main が走り、モデルの読み込みとシミュレーションの準備まで同期で行う

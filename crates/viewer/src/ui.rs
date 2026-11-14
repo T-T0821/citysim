@@ -234,6 +234,16 @@ pub fn settings_panel(
                 ui.label("歩行者数");
                 ui.add(egui::Slider::new(&mut settings.agents, 0..=100_000).logarithmic(true));
                 ui.end_row();
+                // 銀座は 10 万人で約 1.2 人/m²。それより多い人数は合成の広い街で試す
+                ui.label("");
+                if ui
+                    .link("100 万人の負荷テスト（合成の街, GPU）→")
+                    .on_hover_text("乱数で作った 2km 四方の街で、計算も描画も GPU 上で行います")
+                    .clicked()
+                {
+                    crate::stress::reload_with("?city=synthetic");
+                }
+                ui.end_row();
                 ui.label("車両数");
                 ui.add(egui::Slider::new(&mut settings.vehicles, 0..=300));
                 ui.end_row();
