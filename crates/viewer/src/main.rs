@@ -60,6 +60,8 @@ struct Args {
     evacuate_at: Option<f32>,
     /// `synthetic` なら合成の街での負荷テスト（100 万人, GPU で計算）
     city: Option<String>,
+    /// 負荷テストの歩行者モデル（`lite` で密度場の軽量モデル）
+    model: Option<String>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -86,6 +88,7 @@ fn parse_args() -> Result<Args> {
         shelters: vec![],
         evacuate_at: None,
         city: None,
+        model: None,
         cell: 0.5,
         seed: 1,
         respawn: true,
@@ -198,6 +201,7 @@ fn parse_args() -> Result<Args> {
             "--place" => a.place = Some(v()?),
             "--radius" => a.radius = v()?.parse()?,
             "--city" => a.city = Some(v()?),
+            "--model" => a.model = Some(v()?),
             "--data-dir" => a.data_dir = v()?.into(),
             // 避難所: 緯度,経度[,名前]（複数可）
             "--shelter" => a.shelters.push(evac::parse_shelter(&v()?)?),
@@ -531,6 +535,7 @@ fn run() -> Result<()> {
             seed: args.seed,
             speed: args.speed,
             mobile: is_mobile(),
+            lite: args.model.as_deref() == Some("lite"),
         });
         return Ok(());
     }
