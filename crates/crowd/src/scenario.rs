@@ -53,20 +53,32 @@ pub fn through_traffic(
     let mut sim = Simulation::new(grid, flows, Params::default());
     let mut rng = Rng::new(seed);
     let mut cells: Vec<_> = sim.grid.walkable_cells().collect();
-    if cells.iter().any(|&(x, y)| on_sidewalk(&sim.grid, x, y)) {
-        cells.retain(|&(x, y)| on_sidewalk(&sim.grid, x, y));
+    let cell_area = sim.grid.cell * sim.grid.cell;
+    let sidewalk: Vec<_> = cells
+        .iter()
+        .copied()
+        .filter(|&(x, y)| on_sidewalk(&sim.grid, x, y))
+        .collect();
+    // 歩道だけで 1.5 人/m^2 を超える人数なら車道にも置く（10 万人規模）
+    if !sidewalk.is_empty() && (n_agents as f32) < sidewalk.len() as f32 * cell_area * 1.5 {
+        cells = sidewalk;
     }
-    // 既に置いた人の近く (0.6m 以内) を避けるための格子（全員と比べると大人数で O(N²) になる）
-    const MIN_GAP: f32 = 0.6;
+    // 既に置いた人の近く (MIN_GAP 以内) を避けるための格子（全員と比べると大人数で O(N²) になる）。
+    // 通常は 0.6m あけ、大人数で入りきらないときは詰める（最小 0.35m）
+    let area = cells.len() as f32 * cell_area;
+    let min_gap = (area / n_agents.max(1) as f32 * 0.5)
+        .sqrt()
+        .clamp(0.35, 0.6);
+    let gap2 = min_gap * min_gap;
     let mut placed: std::collections::HashMap<(i32, i32), Vec<Vec2>> = Default::default();
     let key = |p: Vec2| {
         (
-            (p.x / MIN_GAP).floor() as i32,
-            (p.y / MIN_GAP).floor() as i32,
+            (p.x / min_gap).floor() as i32,
+            (p.y / min_gap).floor() as i32,
         )
     };
     let mut tries = 0;
-    while sim.agents.len() < n_agents && tries < n_agents * 100 {
+    while sim.agents.len() < n_agents && tries < n_agents * 30 {
         tries += 1;
         let (cx, cy) = cells[(rng.next_u64() % cells.len() as u64) as usize];
         let pos = sim.grid.center(cx, cy)
@@ -82,7 +94,7 @@ pub fn through_traffic(
             (-1..=1).any(|dx| {
                 placed
                     .get(&(kx + dx, ky + dy))
-                    .is_some_and(|v| v.iter().any(|q| q.distance_squared(pos) < 0.36))
+                    .is_some_and(|v| v.iter().any(|q| q.distance_squared(pos) < gap2))
             })
         });
         if crowded {

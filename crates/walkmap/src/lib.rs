@@ -330,6 +330,9 @@ impl WalkGrid {
 #[derive(Debug, Clone)]
 pub struct FlowField {
     pub dist: Vec<f32>,
+    /// セルごとの次に向かう近傍（`dy * 3 + dx + 4` の 0〜8。4 は目的地セル、`NO_NEXT` は到達不能）。
+    /// 毎ステップ全員が 9 近傍を調べ直さなくて済むよう、距離場を作るときに 1 度だけ求める。
+    next: Vec<u8>,
 }
 
 impl FlowField {
@@ -391,7 +394,10 @@ impl FlowField {
                 }
             }
         }
-        Self { dist }
+        let next = (0..grid.w * grid.h)
+            .map(|i| next_of(grid, &dist, i % grid.w, i / grid.w))
+            .collect();
+        Self { dist, next }
     }
 
     /// 位置 p における進行方向（単位ベクトル）。到達不能なら None。
@@ -406,24 +412,14 @@ impl FlowField {
     /// 到達不能なら None、目的地セルにいれば Some(None)。
     pub fn next_cell(&self, grid: &WalkGrid, p: Vec2) -> Option<Option<(usize, usize)>> {
         let (cx, cy) = grid.cell_of(p)?;
-        let here = self.dist[grid.idx(cx, cy)];
-        if !here.is_finite() {
-            return None;
+        match self.next[grid.idx(cx, cy)] {
+            NO_NEXT => None,
+            4 => Some(None),
+            k => Some(Some((
+                (cx as i32 + (k % 3) as i32 - 1) as usize,
+                (cy as i32 + (k / 3) as i32 - 1) as usize,
+            ))),
         }
-        let mut best = (here, None);
-        for dy in -1i32..=1 {
-            for dx in -1i32..=1 {
-                let (nx, ny) = (cx as i32 + dx, cy as i32 + dy);
-                if nx < 0 || ny < 0 || nx as usize >= grid.w || ny as usize >= grid.h {
-                    continue;
-                }
-                let d = self.dist[grid.idx(nx as usize, ny as usize)];
-                if d < best.0 {
-                    best = (d, Some((nx as usize, ny as usize)));
-                }
-            }
-        }
-        Some(best.1)
     }
 
     pub fn distance(&self, grid: &WalkGrid, p: Vec2) -> f32 {
@@ -431,6 +427,30 @@ impl FlowField {
             .map(|(x, y)| self.dist[grid.idx(x, y)])
             .unwrap_or(Self::UNREACHABLE)
     }
+}
+
+const NO_NEXT: u8 = u8::MAX;
+
+/// セル (cx, cy) から次に向かう近傍（近傍で最も距離の小さいセル。補間ノイズに強い）
+fn next_of(grid: &WalkGrid, dist: &[f32], cx: usize, cy: usize) -> u8 {
+    let here = dist[grid.idx(cx, cy)];
+    if !here.is_finite() {
+        return NO_NEXT;
+    }
+    let mut best = (here, 4u8);
+    for dy in -1i32..=1 {
+        for dx in -1i32..=1 {
+            let (nx, ny) = (cx as i32 + dx, cy as i32 + dy);
+            if nx < 0 || ny < 0 || nx as usize >= grid.w || ny as usize >= grid.h {
+                continue;
+            }
+            let d = dist[grid.idx(nx as usize, ny as usize)];
+            if d < best.0 {
+                best = (d, ((dy + 1) * 3 + dx + 1) as u8);
+            }
+        }
+    }
+    best.1
 }
 
 #[derive(PartialEq)]
