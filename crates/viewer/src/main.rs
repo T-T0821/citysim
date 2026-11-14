@@ -11,6 +11,8 @@ mod person;
 mod place;
 mod scenario;
 mod signals;
+mod stress;
+mod synth_city;
 mod ui;
 #[cfg(target_arch = "wasm32")]
 mod web;
@@ -56,6 +58,8 @@ struct Args {
     data_dir: PathBuf,
     shelters: Vec<(String, f64, f64)>,
     evacuate_at: Option<f32>,
+    /// `synthetic` なら合成の街での負荷テスト（100 万人, GPU で計算）
+    city: Option<String>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -81,6 +85,7 @@ fn parse_args() -> Result<Args> {
         data_dir: PathBuf::from(place::DEFAULT_DATA_DIR),
         shelters: vec![],
         evacuate_at: None,
+        city: None,
         cell: 0.5,
         seed: 1,
         respawn: true,
@@ -192,6 +197,7 @@ fn parse_args() -> Result<Args> {
             // 場所（住所 or 緯度,経度）。--gml が無ければ PLATEAU の CityGML を自動で取得する
             "--place" => a.place = Some(v()?),
             "--radius" => a.radius = v()?.parse()?,
+            "--city" => a.city = Some(v()?),
             "--data-dir" => a.data_dir = v()?.into(),
             // 避難所: 緯度,経度[,名前]（複数可）
             "--shelter" => a.shelters.push(evac::parse_shelter(&v()?)?),
@@ -516,6 +522,18 @@ const MOBILE_VEHICLES: usize = 40;
 
 fn run() -> Result<()> {
     let args = parse_args()?;
+    if let Some(c) = &args.city {
+        if c != "synthetic" {
+            bail!("--city に指定できるのは synthetic だけです");
+        }
+        stress::run(stress::StressArgs {
+            agents: args.agents_given.then_some(args.agents),
+            seed: args.seed,
+            speed: args.speed,
+            mobile: is_mobile(),
+        });
+        return Ok(());
+    }
     let (model, bounds) = load_model(&args)?;
     info!(
         "建物 {} 棟, 道路 {} 件",
